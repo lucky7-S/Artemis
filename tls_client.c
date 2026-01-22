@@ -17,15 +17,18 @@
  *     gcc tls_client.c -o tls_client -lssl -lcrypto
  *
  * USAGE:
- *   ./tls_client <ip> <port> [host] [user-agent]
+ *   ./tls_client --ip <addr> --port <num> [options]
  *
- *   Arguments:
- *     ip         - Target server IP address (e.g., "127.0.0.1")
- *     port       - Target server port (e.g., 443 or 4433)
- *     host       - (Optional) Hostname for SNI and Host header
- *                  Default: "www.microsoft.com"
- *     user-agent - (Optional) User-Agent string for HTTP headers
- *                  Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)..."
+ *   Required:
+ *     --ip,   -i <addr>    Server IP address
+ *     --port, -p <num>     Server port number
+ *
+ *   Optional:
+ *     --host, -h <name>    Hostname for SNI and Host header
+ *                          Default: "www.microsoft.com"
+ *     --ua,   -u <string>  User-Agent string for HTTP headers
+ *                          Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)..."
+ *     --help               Show help message
  *
  * DEPENDENCIES:
  *   - OpenSSL library (libssl, libcrypto)
@@ -119,13 +122,8 @@
 
 /*
  * ============================================================================
- * MAIN FUNCTION
- * ============================================================================
- */
-/*
- * ----------------------------------------------------------------------------
  * HELPER FUNCTION: Print usage information
- * ----------------------------------------------------------------------------
+ * ============================================================================
  */
 void print_usage(const char *program_name) {
     fprintf(stderr, "Usage: %s --ip <addr> --port <num> [options]\n", program_name);
@@ -145,6 +143,11 @@ void print_usage(const char *program_name) {
     fprintf(stderr, "  %s -i 127.0.0.1 -p 443 -h google.com -u \"Mozilla/5.0 (iPhone)\"\n", program_name);
 }
 
+/*
+ * ============================================================================
+ * MAIN FUNCTION
+ * ============================================================================
+ */
 int main(int argc, char *argv[]) {
 
     /*
