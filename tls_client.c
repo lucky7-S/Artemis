@@ -2,8 +2,7 @@
  * Lightweight TLS/HTTPS Client
  * gcc tls_client.c -o tls_client.exe -lssl -lcrypto -lws2_32
  * A minimal TLS client that connects to a specified IP/port,
- * prints "Hello World" after establishing a secure connection,
- * then cleanly disconnects.
+ * sends "Hello World" every 5 minutes over the secure connection.
  *
  * Dependencies: OpenSSL (libssl, libcrypto)
  */
@@ -172,31 +171,30 @@ int main(int argc, char *argv[]) {
 
     /*
      * SUCCESS! We now have an encrypted TLS connection.
-     * Print our message to demonstrate the connection worked.
+     * Send "Hello World" every 5 minutes (300000 ms).
      */
-    SSL_write(ssl, "Hello World\n", 12);
+    printf("Connected! Sending 'Hello World' every 5 minutes. Press Ctrl+C to stop.\n");
 
-    /*
-     * Clean shutdown sequence
-     * Proper cleanup is important to avoid resource leaks and ensure
-     * the connection is closed gracefully.
-     */
+    while (1) {
+        int bytes = SSL_write(ssl, "Hello World\n", 12);
+        if (bytes <= 0) {
+            fprintf(stderr, "SSL_write failed, connection may be closed\n");
+            ERR_print_errors_fp(stderr);
+            break;
+        }
+        printf("Sent: Hello World\n");
 
-    /*
-     * SSL_shutdown(): Send TLS "close notify" alert
-     * This tells the server we're done and allows for a graceful TLS shutdown.
-     * A complete shutdown requires calling this twice (send and receive),
-     * but for a simple disconnect, one call is sufficient.
-     */
+#ifdef _WIN32
+        Sleep(300000);  /* 5 minutes in milliseconds */
+#else
+        sleep(300);     /* 5 minutes in seconds */
+#endif
+    }
+
+    /* Clean shutdown and resource cleanup */
     SSL_shutdown(ssl);
-
-    /* SSL_free(): Free the SSL structure and associated resources */
     SSL_free(ssl);
-
-    /* Close the underlying TCP socket */
     closesocket(sock);
-
-    /* SSL_CTX_free(): Free the SSL context */
     SSL_CTX_free(ctx);
 
 #ifdef _WIN32
