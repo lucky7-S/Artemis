@@ -3,12 +3,6 @@
  * TLS/HTTPS Client with HTTP Protocol Support
  * ============================================================================
  *
- * DESCRIPTION:
- *   A TLS client that establishes encrypted connections and sends HTTP
- *   requests (GET and POST) to mimic legitimate HTTPS web traffic.
- *   The client maintains a persistent connection and sends requests
- *   at regular intervals.
- *
  * COMPILATION:
  *   Windows (MinGW/MSYS2):
  *     gcc tls_client.c -o tls_client.exe -lssl -lcrypto -lws2_32
@@ -38,7 +32,7 @@
  *   - Uses TLS 1.2 for encryption
  *   - Sends SNI (Server Name Indication) in ClientHello
  *   - Alternates between HTTP GET and POST requests
- *   - Includes realistic HTTP headers (Host, User-Agent, Content-Type)
+ *   - Includes HTTP headers (Host, User-Agent, Content-Type)
  *   - Maintains persistent connection (Connection: keep-alive)
  *
  * ============================================================================
@@ -171,7 +165,7 @@ int main(int argc, char *argv[]) {
     int port = 0;                                   /* Required - must be set */
     const char *host = "www.microsoft.com";         /* Optional - has default */
     const char *user_agent =                        /* Optional - has default */
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
 
     /*
      * Parse command-line arguments
@@ -315,17 +309,102 @@ int main(int argc, char *argv[]) {
     }
 
     /*
-     * LIMIT TO TLS 1.2
+     * CONFIGURE TLS VERSION RANGE
      *
-     * We explicitly limit to TLS 1.2 because TLS 1.3 has a different
-     * handshake flow that can cause timing issues on Windows with
-     * certain OpenSSL/Python combinations.
-     *
-     * TLS 1.2 is still secure and widely used. The main differences:
-     * - TLS 1.2: 2-RTT handshake, separate key exchange message
-     * - TLS 1.3: 1-RTT handshake, key exchange in ClientHello
+     * Support TLS 1.2 and TLS 1.3 to match Chrome browser fingerprint.
+     * The supported_versions extension will advertise: TLS 1.3, TLS 1.2
      */
-    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+
+    /*
+     * CONFIGURE CIPHER SUITES (Chrome-like ordering)
+     *
+     * TLS 1.3 ciphers must be set separately using SSL_CTX_set_ciphersuites()
+     * TLS 1.2 ciphers use SSL_CTX_set_cipher_list()
+     */
+
+    /* TLS 1.3 ciphersuites */
+    if (SSL_CTX_set_ciphersuites(ctx,
+            "TLS_AES_128_GCM_SHA256:"
+            "TLS_AES_256_GCM_SHA384:"
+            "TLS_CHACHA20_POLY1305_SHA256") != 1) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    /* TLS 1.2 ciphersuites */
+    const char *tls12_ciphers =
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-AES128-SHA:"
+        "ECDHE-RSA-AES256-SHA:"
+        "AES128-GCM-SHA256:"
+        "AES256-GCM-SHA384:"
+        "AES128-SHA:"
+        "AES256-SHA";
+    if (SSL_CTX_set_cipher_list(ctx, tls12_ciphers) != 1) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    
+    /*
+     * Set Supported Groups (supported_groups extension)
+     *
+     * Chrome uses: X25519Kyber768, X25519, P-256, P-384
+     * Note: X25519Kyber768 (post-quantum) requires special OpenSSL build
+     * We use the standard curves that OpenSSL supports.
+     */
+    if (SSL_CTX_set1_curves_list(ctx, "X25519:P-256:P-384") != 1) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    // 4. Enable other common Chrome extensions through options
+    // This enables certain behaviors like session ticket support.
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
+
+    // 5. Set Signature Algorithms (another critical extension)
+    if (SSL_CTX_set1_sigalgs_list(ctx, "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512") != 1) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    /*
+     * CONFIGURE ALPN (application_layer_protocol_negotiation extension)
+     *
+     * Advertises supported application protocols: h2 (HTTP/2), http/1.1
+     * Format: length-prefixed strings concatenated together
+     */
+    static const unsigned char alpn_protos[] = {
+        2, 'h', '2',                              /* HTTP/2 */
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1' /* HTTP/1.1 */
+    };
+    SSL_CTX_set_alpn_protos(ctx, alpn_protos, sizeof(alpn_protos));
+
+    /*
+     * ENABLE OCSP STAPLING (status_request extension)
+     *
+     * Requests OCSP response from server during handshake.
+     */
+    SSL_CTX_set_tlsext_status_type(ctx, TLSEXT_STATUSTYPE_ocsp);
+
+    /*
+     * ENABLE CERTIFICATE TRANSPARENCY (signed_certificate_timestamp extension)
+     *
+     * Requests SCT from server. Extension type 18.
+     */
+    SSL_CTX_enable_ct(ctx, SSL_CT_VALIDATION_PERMISSIVE);
+
+    /*
+     * ENSURE SESSION TICKETS ARE ENABLED (session_ticket extension)
+     *
+     * Session tickets allow TLS session resumption.
+     */
+    SSL_CTX_clear_options(ctx, SSL_OP_NO_TICKET);
 
     /*
      * ------------------------------------------------------------------------
@@ -453,13 +532,7 @@ int main(int argc, char *argv[]) {
      *   to know which certificate to present before decryption starts.
      *   SNI solves this by having the client specify the desired hostname.
      *
-     * WHY WE SET IT:
-     *   1. Most legitimate HTTPS traffic includes SNI
-     *   2. Missing SNI is a red flag for traffic analysis
-     *   3. It makes our traffic look like normal browser traffic
-     *
      * The server in our case ignores SNI and always uses the same cert,
-     * but setting it makes the traffic appear legitimate.
      */
     SSL_set_tlsext_host_name(ssl, host);
 
@@ -693,9 +766,6 @@ int main(int argc, char *argv[]) {
          * Windows uses Sleep() with milliseconds.
          * Unix uses sleep() with seconds.
          *
-         * This interval could be randomized to avoid detection of
-         * regular "beaconing" patterns, which are a red flag for
-         * security tools looking for malware C2 traffic.
          */
 #ifdef _WIN32
         Sleep(300000);  /* 300,000 milliseconds = 5 minutes */

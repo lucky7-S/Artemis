@@ -53,7 +53,7 @@ import sys      # System-specific parameters (unused but available for extension
 #   - 4433 is commonly used for testing (no special privileges needed)
 #   - Ports below 1024 are "privileged" on Unix systems
 
-HOST = '127.0.0.1'
+HOST = '127.0.0.8'
 PORT = 4433
 
 # ==============================================================================
