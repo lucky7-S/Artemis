@@ -39,6 +39,19 @@ TRAFFIC CHARACTERISTICS:
 import ssl      # Python's SSL/TLS wrapper for secure socket communication
 import socket   # Low-level networking interface (TCP/UDP sockets)
 import sys      # System-specific parameters (unused but available for extensions)
+import json     # JSON parsing for extracting client_ip from POST body
+import time     # For timestamps in peer table
+
+# ==============================================================================
+# MESH NETWORK STATE
+# ==============================================================================
+#
+# The server maintains state about the mesh network:
+#   - is_parent_assigned: Whether we've assigned a parent node
+#   - peer_table: Master list of all peers (parent + children)
+
+is_parent_assigned = False
+peer_table = {}  # {ip: {"timestamp": ..., "active": True}}
 
 # ==============================================================================
 # SERVER CONFIGURATION
@@ -368,6 +381,36 @@ try:
                         body = request[body_start + 4:]
                         print(f"  Body: {body}", flush=True)
 
+                        # Extract and process the JSON body
+                        try:
+                            body_json = json.loads(body)
+
+                            # Handle aggregated client data from parent node
+                            if 'clients' in body_json:
+                                print(f"  Received aggregated data from parent", flush=True)
+                                for client in body_json['clients']:
+                                    client_ip = client.get('ip', 'unknown')
+                                    timestamp = client.get('timestamp', int(time.time()))
+                                    peer_table[client_ip] = {
+                                        "timestamp": timestamp,
+                                        "active": True
+                                    }
+                                    print(f"    Peer: {client_ip} @ {timestamp}", flush=True)
+                                print(f"  Master peer table: {list(peer_table.keys())}", flush=True)
+
+                            # Handle single client telemetry
+                            elif 'client_ip' in body_json:
+                                client_ip = body_json['client_ip']
+                                timestamp = body_json.get('timestamp', int(time.time()))
+                                peer_table[client_ip] = {
+                                    "timestamp": timestamp,
+                                    "active": True
+                                }
+                                print(f"  Client IP: {client_ip}", flush=True)
+                                print(f"  Master peer table: {list(peer_table.keys())}", flush=True)
+                        except json.JSONDecodeError:
+                            pass  # Body is not valid JSON, ignore
+
                 # ----------------------------------------------------------
                 # BUILD HTTP RESPONSE
                 # ----------------------------------------------------------
@@ -393,11 +436,34 @@ try:
                 #   Content-Type - MIME type of response body
                 #   Connection - keep-alive or close
 
-                # Choose response based on request method
+                # Access the global parent assignment flag
+                global is_parent_assigned
+
+                # Choose response based on request method and mesh state
                 if method == 'GET':
-                    response_body = '{"status":"healthy","version":"1.0"}'
+                    # First connection becomes the parent node
+                    if not is_parent_assigned:
+                        is_parent_assigned = True
+                        response_body = json.dumps({
+                            "status": "healthy",
+                            "version": "1.0",
+                            "role": "parent",
+                            "listen_port": 4434
+                        })
+                        print(f"  Assigned as PARENT node", flush=True)
+                    else:
+                        response_body = json.dumps({
+                            "status": "healthy",
+                            "version": "1.0"
+                        })
                 else:
-                    response_body = '{"received":true}'
+                    # For POST responses, include peer table for parent
+                    peer_list = [{"ip": ip, "timestamp": data["timestamp"]}
+                                 for ip, data in peer_table.items()]
+                    response_body = json.dumps({
+                        "received": True,
+                        "peer_table": peer_list
+                    })
 
                 # Build the complete HTTP response
                 # Note: Content-Length MUST match the actual body length
