@@ -61,7 +61,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <h2>Network Topology</h2>
     <div class="diagram">
         <div class="node server">SERVER</div>
-        <div class="line">|</div>
+        <div class="line">| https: {https_interval}</div>
         <div class="node parent">{parent_ip}</div>
         {child_diagram}
         <div style="margin-top:15px; font-size:11px; color:#666;">
@@ -127,11 +127,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except:
             pass
 
-        # Build peer rows
+        # Build peer rows and calculate intervals
         from datetime import datetime
-        global previous_timestamps
+        global previous_timestamps, previous_parent_contact
         peers = state.get('peers', {})
         rows = ""
+        intervals = {}  # Store intervals for diagram use
+
         for ip, data in peers.items():
             ts = data.get('timestamp', 0)
             hostname = data.get('hostname', 'unknown')
@@ -144,6 +146,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 interval = ts - previous_timestamps[ip]
                 if interval > 0:
                     interval_str = f"{interval}s"
+                    intervals[ip] = interval_str
 
             # Store current timestamp for next calculation
             if ts > 0:
@@ -154,17 +157,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not rows:
             rows = "<tr><td colspan='5'>No peers connected</td></tr>"
 
-        # Parent info
+        # Parent info and HTTPS interval
         parent_ip = state.get('parent_ip', 'None')
         last_contact = state.get('last_contact', 0)
         parent_time = datetime.fromtimestamp(last_contact).strftime('%Y-%m-%d %H:%M:%S') if last_contact else 'Never'
 
-        # Build child diagram
+        # Calculate HTTPS interval for parent
+        https_interval = "-"
+        if previous_parent_contact > 0 and last_contact > 0:
+            interval = last_contact - previous_parent_contact
+            if interval > 0:
+                https_interval = f"{interval}s"
+        if last_contact > 0:
+            previous_parent_contact = last_contact
+
+        # Build child diagram with UDP intervals
         child_diagram = ""
         if peers:
             child_diagram = '<div class="line">'
             for ip in peers:
-                child_diagram += " | "
+                udp_int = intervals.get(ip, '-')
+                child_diagram += f" udp:{udp_int} "
             child_diagram += '</div><div>'
             for ip, data in peers.items():
                 os_info = data.get('os', '').lower()
@@ -183,7 +196,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             peer_count=len(peers),
             peer_rows=rows,
             current_message=message,
-            child_diagram=child_diagram
+            child_diagram=child_diagram,
+            https_interval=https_interval
         )
 
 print(f"Web interface running on http://localhost:{PORT}")
