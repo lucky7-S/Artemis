@@ -46,11 +46,9 @@ import time     # For timestamps in peer table
 # MESH NETWORK STATE
 # ==============================================================================
 #
-# The server maintains state about the mesh network:
-#   - is_parent_assigned: Whether we've assigned a parent node
-#   - peer_table: Master list of all peers (parent + children)
+# The server maintains the master peer table received from the parent node.
+# The parent sends POST requests containing all known peers (itself + children).
 
-is_parent_assigned = False
 peer_table = {}  # {ip: {"timestamp": ..., "active": True}}
 
 # ==============================================================================
@@ -240,10 +238,9 @@ context.sni_callback = sni_callback
 # ==============================================================================
 
 print("=" * 60, flush=True)
-print("  TLS MESH SERVER v2.0 - WITH PARENT ASSIGNMENT", flush=True)
+print("  TLS MESH SERVER - POST-only peer table receiver", flush=True)
 print("=" * 60, flush=True)
-print(f"Server listening on {HOST}:{PORT}", flush=True)
-print(f"Parent assigned: {is_parent_assigned}", flush=True)
+print(f"Listening on {HOST}:{PORT}", flush=True)
 print("Press Ctrl+C to stop", flush=True)
 print("=" * 60, flush=True)
 
@@ -337,7 +334,6 @@ try:
                     # Empty data means the client closed the connection
                     break
 
-                print(f"  [RECV] Got {len(data)} bytes", flush=True)
 
                 # ----------------------------------------------------------
                 # PARSE HTTP REQUEST
@@ -443,34 +439,18 @@ try:
                 #   Content-Type - MIME type of response body
                 #   Connection - keep-alive or close
 
-                # Choose response based on request method and mesh state
-                print(f"  [Debug] method={method}, is_parent_assigned={is_parent_assigned}", flush=True)
-
-                if method == 'GET':
-                    # First connection becomes the parent node
-                    if not is_parent_assigned:
-                        is_parent_assigned = True
-                        response_body = json.dumps({
-                            "status": "healthy",
-                            "version": "1.0",
-                            "role": "parent",
-                            "listen_port": 4434
-                        })
-                        print(f"  >>> ASSIGNED AS PARENT NODE <<<", flush=True)
-                        print(f"  Response body: {response_body}", flush=True)
-                    else:
-                        response_body = json.dumps({
-                            "status": "healthy",
-                            "version": "1.0"
-                        })
-                        print(f"  Response body: {response_body}", flush=True)
-                else:
-                    # For POST responses, include peer table for parent
-                    peer_list = [{"ip": ip, "timestamp": data["timestamp"]}
-                                 for ip, data in peer_table.items()]
+                # Build response based on request method
+                if method == 'POST':
+                    # POST from parent with peer table - acknowledge receipt
                     response_body = json.dumps({
                         "received": True,
-                        "peer_table": peer_list
+                        "peers_count": len(peer_table)
+                    })
+                else:
+                    # GET requests - simple health check
+                    response_body = json.dumps({
+                        "status": "healthy",
+                        "version": "1.0"
                     })
 
                 # Build the complete HTTP response

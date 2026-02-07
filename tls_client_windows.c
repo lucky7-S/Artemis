@@ -543,16 +543,22 @@ int main(int argc, char *argv[]) {
 
     char request[4096];
     char response[4096];
-    int request_num = 0;
-    int got_parent_role = 0;
 
     add_peer(my_ip, (long)time(NULL));
 
-    while (1) {
-        char body[2048];
+    /*
+     * Parent mode: Only send POST with peer table, no other communication
+     * Start UDP listener immediately
+     */
+    if (is_parent_mode) {
+        printf("\n*** PARENT MODE: POST-only communication ***\n");
 
-        if (is_parent_mode && got_parent_role) {
-            /* Parent mode: aggregate child data and forward to server */
+        if (start_listener_thread() < 0) {
+            fprintf(stderr, "Failed to start listener thread\n");
+        }
+
+        while (1) {
+            char body[2048];
             build_aggregated_json(body, sizeof(body));
 
             snprintf(request, sizeof(request),
@@ -566,93 +572,93 @@ int main(int argc, char *argv[]) {
                 "%s",
                 host, user_agent, (int)strlen(body), body);
 
-            printf("[Parent] Sending aggregated data to server: %s\n", body);
+            printf("[Parent] POST peer table: %s\n", body);
 
-        } else if (request_num % 2 == 0) {
-            /* GET request */
-            snprintf(request, sizeof(request),
-                "GET /api/v1/status HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "User-Agent: %s\r\n"
-                "Accept: application/json\r\n"
-                "Connection: keep-alive\r\n"
-                "\r\n",
-                host, user_agent);
-
-        } else {
-            /* POST request */
-            snprintf(body, sizeof(body),
-                "{\"status\":\"ok\",\"timestamp\":%ld,\"client_ip\":\"%s\"}",
-                (long)time(NULL), my_ip);
-
-            snprintf(request, sizeof(request),
-                "POST /api/v1/telemetry HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "User-Agent: %s\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: keep-alive\r\n"
-                "\r\n"
-                "%s",
-                host, user_agent, (int)strlen(body), body);
-        }
-
-        int bytes = SSL_write(ssl, request, strlen(request));
-        if (bytes <= 0) {
-            fprintf(stderr, "SSL_write failed\n");
-            ERR_print_errors_fp(stderr);
-            break;
-        }
-
-        if (!got_parent_role) {
-            printf("Sent: %s request\n", (request_num % 2 == 0) ? "GET" : "POST");
-        }
-
-        int resp_bytes = SSL_read(ssl, response, sizeof(response) - 1);
-        if (resp_bytes <= 0) {
-            fprintf(stderr, "SSL_read failed\n");
-            ERR_print_errors_fp(stderr);
-            break;
-        }
-        response[resp_bytes] = '\0';
-
-        /* Parse response - find body first, before modifying buffer */
-        char *body_start = strstr(response, "\r\n\r\n");
-
-        /* Check for parent role in body BEFORE we modify the buffer */
-        int has_parent_role = 0;
-        if (body_start) {
-            char *body_content = body_start + 4;
-            if (is_parent_mode && !got_parent_role) {
-                printf("[Debug] Body: %s\n", body_content);
+            int bytes = SSL_write(ssl, request, strlen(request));
+            if (bytes <= 0) {
+                fprintf(stderr, "SSL_write failed\n");
+                ERR_print_errors_fp(stderr);
+                break;
             }
-            if (strstr(body_content, "\"role\":\"parent\"")) {
-                has_parent_role = 1;
+
+            int resp_bytes = SSL_read(ssl, response, sizeof(response) - 1);
+            if (resp_bytes <= 0) {
+                fprintf(stderr, "SSL_read failed\n");
+                ERR_print_errors_fp(stderr);
+                break;
             }
-        }
+            response[resp_bytes] = '\0';
 
-        /* Now safe to modify for display */
-        char *newline = strchr(response, '\r');
-        if (newline) *newline = '\0';
-        printf("Response: %s\n", response);
+            char *newline = strchr(response, '\r');
+            if (newline) *newline = '\0';
+            printf("Response: %s\n", response);
 
-        if (is_parent_mode && !got_parent_role && has_parent_role) {
-            printf("\n*** ASSIGNED AS PARENT NODE ***\n");
-            got_parent_role = 1;
-
-            if (start_listener_thread() < 0) {
-                fprintf(stderr, "Failed to start listener thread\n");
-            }
-        }
-
-        if (is_parent_mode && got_parent_role) {
             print_peer_table();
+            printf("\n");
+
+            Sleep(10000);
         }
+    } else {
+        /*
+         * Normal mode: alternating GET/POST requests
+         */
+        int request_num = 0;
 
-        printf("\n");
-        request_num++;
+        while (1) {
+            char body[2048];
 
-        Sleep(10000);
+            if (request_num % 2 == 0) {
+                /* GET request */
+                snprintf(request, sizeof(request),
+                    "GET /api/v1/status HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "User-Agent: %s\r\n"
+                    "Accept: application/json\r\n"
+                    "Connection: keep-alive\r\n"
+                    "\r\n",
+                    host, user_agent);
+            } else {
+                /* POST request */
+                snprintf(body, sizeof(body),
+                    "{\"status\":\"ok\",\"timestamp\":%ld,\"client_ip\":\"%s\"}",
+                    (long)time(NULL), my_ip);
+
+                snprintf(request, sizeof(request),
+                    "POST /api/v1/telemetry HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "User-Agent: %s\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %d\r\n"
+                    "Connection: keep-alive\r\n"
+                    "\r\n"
+                    "%s",
+                    host, user_agent, (int)strlen(body), body);
+            }
+
+            int bytes = SSL_write(ssl, request, strlen(request));
+            if (bytes <= 0) {
+                fprintf(stderr, "SSL_write failed\n");
+                ERR_print_errors_fp(stderr);
+                break;
+            }
+
+            printf("Sent: %s request\n", (request_num % 2 == 0) ? "GET" : "POST");
+
+            int resp_bytes = SSL_read(ssl, response, sizeof(response) - 1);
+            if (resp_bytes <= 0) {
+                fprintf(stderr, "SSL_read failed\n");
+                ERR_print_errors_fp(stderr);
+                break;
+            }
+            response[resp_bytes] = '\0';
+
+            char *newline = strchr(response, '\r');
+            if (newline) *newline = '\0';
+            printf("Response: %s\n\n");
+
+            request_num++;
+            Sleep(10000);
+        }
     }
 
     listener_running = 0;
