@@ -1,657 +1,400 @@
 /*
- * ============================================================================
- * TLS/HTTPS Client with Mesh Network Support (Linux)
- * ============================================================================
+ * TLS Mesh Client (Linux)
+ * ========================
  *
- * COMPILATION:
- *   Linux:
- *     gcc tls_client_linux.c -o tls_client -lssl -lcrypto -lpthread
+ * Modes:
+ *   PARENT: Connects to server via TLS, receives commands, listens for children via UDP
+ *   CHILD:  Sends telemetry to parent via UDP (fire-and-forget)
+ *   NORMAL: Basic TLS client for testing
  *
- * USAGE:
- *   ./tls_client --ip <addr> --port <num> [options]
+ * Compilation:
+ *   gcc tls_client_linux.c -o tls_client -lssl -lcrypto -lpthread
  *
- *   Required (for normal/parent mode):
- *     --ip,   -i <addr>    Server IP address
- *     --port, -p <num>     Server port number
- *
- *   Required (for child mode):
- *     --parent, -P <ip:port>  Connect to parent node instead of server
- *
- *   Optional:
- *     --host, -h <name>    Hostname for SNI and Host header
- *                          Default: "www.microsoft.com"
- *     --ua,   -u <string>  User-Agent string for HTTP headers
- *     --listen, -l <port>  Listen port for child connections (enables parent mode)
- *     --help               Show help message
- *
- * MODES:
- *   Normal Mode: Connect to server, send telemetry
- *   Parent Mode: Connect to server + listen for children + aggregate data
- *   Child Mode:  Connect to parent node, send telemetry
- *
- * ============================================================================
+ * Usage:
+ *   Parent: ./tls_client -i <server_ip> -p <port> -l <udp_port> [-t interval]
+ *   Child:  ./tls_client -P <parent_ip:port> [-t interval]
+ *   Normal: ./tls_client -i <server_ip> -p <port>
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <time.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
+#include <time.h>
 #include <pthread.h>
-
-/* OpenSSL headers */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-/*
- * ============================================================================
- * PEER TABLE STRUCTURE FOR MESH NETWORK
- * ============================================================================
- */
+/* ============================================================================
+ * CONFIGURATION
+ * ============================================================================ */
+
 #define MAX_PEERS 64
-#define INET_ADDRSTRLEN_CUSTOM 16
+#define BUFFER_SIZE 4096
+
+/* ============================================================================
+ * PEER TABLE - Tracks all known nodes in the mesh
+ * ============================================================================ */
 
 typedef struct {
-    char ip[INET_ADDRSTRLEN_CUSTOM];
+    char ip[16];
     long timestamp;
     int active;
 } Peer;
 
-/* Global peer table - maintained by parent node */
 Peer peer_table[MAX_PEERS];
 int peer_count = 0;
+pthread_mutex_t peer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Mutex for thread-safe peer table access */
-pthread_mutex_t peer_table_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define MUTEX_INIT() pthread_mutex_init(&peer_table_mutex, NULL)
-#define MUTEX_LOCK() pthread_mutex_lock(&peer_table_mutex)
-#define MUTEX_UNLOCK() pthread_mutex_unlock(&peer_table_mutex)
-#define MUTEX_DESTROY() pthread_mutex_destroy(&peer_table_mutex)
+/* Thread-safe peer table operations */
+void peer_add(const char *ip, long ts) {
+    pthread_mutex_lock(&peer_mutex);
 
-/*
- * ============================================================================
- * GLOBAL STATE FOR MESH NETWORK
- * ============================================================================
- */
-
-/* Mode flags */
-int is_parent_mode = 0;
-int is_child_mode = 0;
-int listen_port = 0;
-char parent_ip[64] = "";
-int parent_port = 0;
-int child_interval = 120;  /* UDP send interval in seconds (default: 120) */
-
-/* Flag to signal listener thread to stop */
-volatile int listener_running = 1;
-
-/*
- * ============================================================================
- * HELPER FUNCTION: Add peer to table
- * ============================================================================
- */
-void add_peer(const char *ip, long timestamp) {
-    MUTEX_LOCK();
+    /* Update existing peer */
     for (int i = 0; i < peer_count; i++) {
         if (strcmp(peer_table[i].ip, ip) == 0) {
-            peer_table[i].timestamp = timestamp;
+            peer_table[i].timestamp = ts;
             peer_table[i].active = 1;
-            MUTEX_UNLOCK();
+            pthread_mutex_unlock(&peer_mutex);
             return;
         }
     }
+
+    /* Add new peer */
     if (peer_count < MAX_PEERS) {
-        strncpy(peer_table[peer_count].ip, ip, INET_ADDRSTRLEN_CUSTOM - 1);
-        peer_table[peer_count].ip[INET_ADDRSTRLEN_CUSTOM - 1] = '\0';
-        peer_table[peer_count].timestamp = timestamp;
+        strncpy(peer_table[peer_count].ip, ip, 15);
+        peer_table[peer_count].ip[15] = '\0';
+        peer_table[peer_count].timestamp = ts;
         peer_table[peer_count].active = 1;
         peer_count++;
     }
-    MUTEX_UNLOCK();
+
+    pthread_mutex_unlock(&peer_mutex);
 }
 
-/*
- * ============================================================================
- * HELPER FUNCTION: Build aggregated clients JSON
- * ============================================================================
- */
-int build_aggregated_json(char *buffer, size_t bufsize) {
-    MUTEX_LOCK();
-    int offset = snprintf(buffer, bufsize, "{\"clients\":[");
+/* Build JSON payload with all peers */
+int peer_build_json(char *buf, size_t len) {
+    pthread_mutex_lock(&peer_mutex);
+
+    int n = snprintf(buf, len, "{\"clients\":[");
     for (int i = 0; i < peer_count; i++) {
-        if (i > 0) offset += snprintf(buffer + offset, bufsize - offset, ",");
-        offset += snprintf(buffer + offset, bufsize - offset,
-            "{\"ip\":\"%s\",\"timestamp\":%ld}",
-            peer_table[i].ip, peer_table[i].timestamp);
+        if (i > 0) n += snprintf(buf + n, len - n, ",");
+        n += snprintf(buf + n, len - n, "{\"ip\":\"%s\",\"timestamp\":%ld}",
+                      peer_table[i].ip, peer_table[i].timestamp);
     }
-    offset += snprintf(buffer + offset, bufsize - offset, "]}");
-    MUTEX_UNLOCK();
-    return offset;
+    n += snprintf(buf + n, len - n, "]}");
+
+    pthread_mutex_unlock(&peer_mutex);
+    return n;
 }
 
-/*
- * ============================================================================
- * HELPER FUNCTION: Print peer table
- * ============================================================================
- */
-void print_peer_table(void) {
-    MUTEX_LOCK();
-    printf("\n=== Peer Table (%d peers) ===\n", peer_count);
+void peer_print(void) {
+    pthread_mutex_lock(&peer_mutex);
+    printf("\n=== Peers (%d) ===\n", peer_count);
     for (int i = 0; i < peer_count; i++) {
-        printf("  %s (timestamp: %ld, active: %d)\n",
-               peer_table[i].ip, peer_table[i].timestamp, peer_table[i].active);
+        printf("  %s @ %ld\n", peer_table[i].ip, peer_table[i].timestamp);
     }
-    printf("=============================\n\n");
-    MUTEX_UNLOCK();
+    printf("==================\n");
+    pthread_mutex_unlock(&peer_mutex);
 }
 
-/*
- * ============================================================================
- * HELPER FUNCTION: Print usage information
- * ============================================================================
- */
-void print_usage(const char *program_name) {
-    fprintf(stderr, "Usage: %s --ip <addr> --port <num> [options]\n", program_name);
-    fprintf(stderr, "\nRequired (for normal/parent mode):\n");
-    fprintf(stderr, "  --ip,   -i <addr>    Server IP address\n");
-    fprintf(stderr, "  --port, -p <num>     Server port number\n");
-    fprintf(stderr, "\nRequired (for child mode):\n");
-    fprintf(stderr, "  --parent, -P <ip:port>  Connect to parent instead of server\n");
-    fprintf(stderr, "\nOptional:\n");
-    fprintf(stderr, "  --host, -h <name>       Hostname for SNI and Host header\n");
-    fprintf(stderr, "  --ua,   -u <string>     User-Agent string\n");
-    fprintf(stderr, "  --listen, -l <port>     Listen port for children (enables parent mode)\n");
-    fprintf(stderr, "  --interval, -t <secs>   UDP send interval for child mode (default: 120)\n");
-    fprintf(stderr, "  --help                  Show this help message\n");
-    fprintf(stderr, "\nExamples:\n");
-    fprintf(stderr, "  %s --ip 127.0.0.1 --port 4433\n", program_name);
-    fprintf(stderr, "  %s -i 127.0.0.1 -p 4433 -l 4434  (parent mode)\n", program_name);
-    fprintf(stderr, "  %s -P 127.0.0.1:4434             (child mode, 120s interval)\n", program_name);
-    fprintf(stderr, "  %s -P 127.0.0.1:4434 -t 5        (child mode, 5s interval)\n", program_name);
-}
+/* ============================================================================
+ * GLOBAL STATE
+ * ============================================================================ */
 
-/*
- * ============================================================================
- * UDP LISTENER: Receive child telemetry (Parent Mode)
- * ============================================================================
- *
- * Children send simple JSON datagrams:
- *   {"ip":"192.168.1.5","ts":1234567890}
- *
- * No acknowledgment - fire and forget.
- */
+int is_parent = 0;          /* Parent mode enabled */
+int is_child = 0;           /* Child mode enabled */
+int listen_port = 0;        /* UDP port for children (parent mode) */
+char parent_ip[64] = "";    /* Parent IP (child mode) */
+int parent_port = 0;        /* Parent port (child mode) */
+int interval = 120;         /* Send interval in seconds */
+volatile int running = 1;   /* Thread control flag */
 
-/*
- * ============================================================================
- * UDP LISTENER THREAD: Receive child datagrams (Parent Mode)
- * ============================================================================
- */
-void *listener_thread(void *arg) {
-    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_sock < 0) {
-        fprintf(stderr, "Failed to create UDP socket\n");
+/* ============================================================================
+ * UDP LISTENER THREAD (Parent Mode)
+ * Receives telemetry from child nodes
+ * ============================================================================ */
+
+void *udp_listener(void *arg) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return NULL;
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(listen_port);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("[!] UDP bind failed on port %d\n", listen_port);
+        close(sock);
         return NULL;
     }
 
-    struct sockaddr_in listen_addr;
-    memset(&listen_addr, 0, sizeof(listen_addr));
-    listen_addr.sin_family = AF_INET;
-    listen_addr.sin_addr.s_addr = INADDR_ANY;
-    listen_addr.sin_port = htons(listen_port);
+    printf("[*] UDP listening on port %d\n", listen_port);
 
-    if (bind(udp_sock, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
-        fprintf(stderr, "Failed to bind UDP on port %d\n", listen_port);
-        close(udp_sock);
-        return NULL;
+    char buf[1024];
+    while (running) {
+        struct sockaddr_in src;
+        socklen_t srclen = sizeof(src);
+
+        int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&src, &srclen);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+
+        /* Get sender IP */
+        char ip[16];
+        inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
+
+        /* Parse timestamp from {"ip":"...","ts":123} */
+        long ts = (long)time(NULL);
+        char *p = strstr(buf, "\"ts\":");
+        if (p) ts = atol(p + 5);
+
+        printf("[UDP] %s: %s\n", ip, buf);
+        peer_add(ip, ts);
+        peer_print();
     }
 
-    printf("[Parent] Listening for UDP datagrams on port %d\n", listen_port);
-
-    char buffer[1024];
-    while (listener_running) {
-        struct sockaddr_in child_addr;
-        socklen_t child_len = sizeof(child_addr);
-
-        int bytes = recvfrom(udp_sock, buffer, sizeof(buffer) - 1, 0,
-                             (struct sockaddr *)&child_addr, &child_len);
-        if (bytes <= 0) continue;
-
-        buffer[bytes] = '\0';
-
-        char child_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &child_addr.sin_addr, child_ip, sizeof(child_ip));
-
-        /* Parse timestamp from JSON: {"ip":"...","ts":1234567890} */
-        char *ts_ptr = strstr(buffer, "\"ts\":");
-        long timestamp = (long)time(NULL);
-        if (ts_ptr) {
-            timestamp = atol(ts_ptr + 5);
-        }
-
-        printf("[Parent] UDP from %s: %s\n", child_ip, buffer);
-        add_peer(child_ip, timestamp);
-        print_peer_table();
-    }
-
-    close(udp_sock);
+    close(sock);
     return NULL;
 }
 
-/*
- * ============================================================================
- * HELPER FUNCTION: Start UDP listener thread for parent mode
- * ============================================================================
- */
-int start_listener_thread(void) {
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, listener_thread, NULL) != 0) {
-        fprintf(stderr, "Failed to create listener thread\n");
-        return -1;
-    }
-    pthread_detach(thread);
-    return 0;
-}
+/* ============================================================================
+ * TLS CONFIGURATION
+ * ============================================================================ */
 
-/*
- * ============================================================================
- * MAIN FUNCTION
- * ============================================================================
- */
-int main(int argc, char *argv[]) {
-    const char *ip = NULL;
-    int port = 0;
-    const char *host = "www.microsoft.com";
-    const char *user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
-
-    /* Parse command-line arguments */
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        }
-        else if (strcmp(argv[i], "--ip") == 0 || strcmp(argv[i], "-i") == 0) {
-            if (i + 1 < argc) {
-                ip = argv[++i];
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
-            if (i + 1 < argc) {
-                port = atoi(argv[++i]);
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--host") == 0 || strcmp(argv[i], "-h") == 0) {
-            if (i + 1 < argc) {
-                host = argv[++i];
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--ua") == 0 || strcmp(argv[i], "-u") == 0) {
-            if (i + 1 < argc) {
-                user_agent = argv[++i];
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--listen") == 0 || strcmp(argv[i], "-l") == 0) {
-            if (i + 1 < argc) {
-                listen_port = atoi(argv[++i]);
-                is_parent_mode = 1;
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--interval") == 0 || strcmp(argv[i], "-t") == 0) {
-            if (i + 1 < argc) {
-                child_interval = atoi(argv[++i]);
-                if (child_interval < 1) child_interval = 1;
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--parent") == 0 || strcmp(argv[i], "-P") == 0) {
-            if (i + 1 < argc) {
-                char *parent_arg = argv[++i];
-                char *colon = strchr(parent_arg, ':');
-                if (colon) {
-                    size_t ip_len = colon - parent_arg;
-                    if (ip_len >= sizeof(parent_ip)) ip_len = sizeof(parent_ip) - 1;
-                    strncpy(parent_ip, parent_arg, ip_len);
-                    parent_ip[ip_len] = '\0';
-                    parent_port = atoi(colon + 1);
-                    is_child_mode = 1;
-                } else {
-                    fprintf(stderr, "Error: --parent requires ip:port format\n");
-                    return 1;
-                }
-            } else {
-                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
-                return 1;
-            }
-        }
-        else {
-            fprintf(stderr, "Error: Unknown argument '%s'\n", argv[i]);
-            print_usage(argv[0]);
-            return 1;
-        }
-    }
-
-    /* Validate required arguments */
-    if (!is_child_mode && (ip == NULL || port == 0)) {
-        fprintf(stderr, "Error: --ip and --port are required (or use --parent for child mode)\n\n");
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    /*
-     * ========================================================================
-     * CHILD MODE: Simple UDP sender (no TLS, no HTTP)
-     * ========================================================================
-     */
-    if (is_child_mode) {
-        printf("Mode: CHILD (UDP to parent %s:%d)\n", parent_ip, parent_port);
-        printf("Sending UDP telemetry every %d seconds. Press Ctrl+C to stop.\n\n", child_interval);
-
-        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_sock < 0) {
-            fprintf(stderr, "Failed to create UDP socket\n");
-            return 1;
-        }
-
-        struct sockaddr_in parent_addr;
-        memset(&parent_addr, 0, sizeof(parent_addr));
-        parent_addr.sin_family = AF_INET;
-        parent_addr.sin_port = htons(parent_port);
-        inet_pton(AF_INET, parent_ip, &parent_addr.sin_addr);
-
-        /* Get our local IP */
-        int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-        connect(temp_sock, (struct sockaddr *)&parent_addr, sizeof(parent_addr));
-        struct sockaddr_in local_addr;
-        socklen_t local_len = sizeof(local_addr);
-        getsockname(temp_sock, (struct sockaddr *)&local_addr, &local_len);
-        char my_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &local_addr.sin_addr, my_ip, sizeof(my_ip));
-        close(temp_sock);
-
-        char buffer[256];
-        while (1) {
-            snprintf(buffer, sizeof(buffer), "{\"ip\":\"%s\",\"ts\":%ld}", my_ip, (long)time(NULL));
-            sendto(udp_sock, buffer, strlen(buffer), 0,
-                   (struct sockaddr *)&parent_addr, sizeof(parent_addr));
-            printf("[Child] Sent: %s\n", buffer);
-            sleep(child_interval);
-        }
-
-        close(udp_sock);
-        return 0;
-    }
-
-    /*
-     * ========================================================================
-     * PARENT/NORMAL MODE: TLS connection to server
-     * ========================================================================
-     */
-    MUTEX_INIT();
-
-    /* Initialize OpenSSL */
+SSL_CTX *create_tls_context(void) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
 
-    /* Create SSL context */
-    const SSL_METHOD *method = TLS_client_method();
-    SSL_CTX *ctx = SSL_CTX_new(method);
-    if (!ctx) {
-        fprintf(stderr, "SSL_CTX_new failed\n");
-        return 1;
-    }
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
 
-    /* Configure TLS */
+    /* TLS 1.2/1.3 with modern ciphers */
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-
-    if (SSL_CTX_set_ciphersuites(ctx,
-            "TLS_AES_128_GCM_SHA256:"
-            "TLS_AES_256_GCM_SHA384:"
-            "TLS_CHACHA20_POLY1305_SHA256") != 1) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    const char *tls12_ciphers =
-        "ECDHE-ECDSA-AES128-GCM-SHA256:"
-        "ECDHE-RSA-AES128-GCM-SHA256:"
-        "ECDHE-ECDSA-AES256-GCM-SHA384:"
-        "ECDHE-RSA-AES256-GCM-SHA384:"
-        "ECDHE-ECDSA-CHACHA20-POLY1305:"
-        "ECDHE-RSA-CHACHA20-POLY1305:"
-        "ECDHE-RSA-AES128-SHA:"
-        "ECDHE-RSA-AES256-SHA:"
-        "AES128-GCM-SHA256:"
-        "AES256-GCM-SHA384:"
-        "AES128-SHA:"
-        "AES256-SHA";
-    if (SSL_CTX_set_cipher_list(ctx, tls12_ciphers) != 1) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    if (SSL_CTX_set1_curves_list(ctx, "X25519:P-256:P-384") != 1) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
-
-    if (SSL_CTX_set1_sigalgs_list(ctx, "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512") != 1) {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    static const unsigned char alpn_protos[] = {
-        2, 'h', '2',
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1'
-    };
-    SSL_CTX_set_alpn_protos(ctx, alpn_protos, sizeof(alpn_protos));
-    SSL_CTX_set_tlsext_status_type(ctx, TLSEXT_STATUSTYPE_ocsp);
-    SSL_CTX_enable_ct(ctx, SSL_CT_VALIDATION_PERMISSIVE);
-    SSL_CTX_clear_options(ctx, SSL_OP_NO_TICKET);
-
-    /* Create TCP socket */
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        fprintf(stderr, "Socket creation failed\n");
-        SSL_CTX_free(ctx);
-        return 1;
-    }
-
-    /* Configure server address */
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
-    /* Connect */
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "Connection failed\n");
-        close(sock);
-        SSL_CTX_free(ctx);
-        return 1;
-    }
-
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_tlsext_host_name(ssl, host);
-    SSL_set_fd(ssl, sock);
+    SSL_CTX_set_ciphersuites(ctx,
+        "TLS_AES_128_GCM_SHA256:"
+        "TLS_AES_256_GCM_SHA384:"
+        "TLS_CHACHA20_POLY1305_SHA256");
 
-    if (SSL_connect(ssl) <= 0) {
-        fprintf(stderr, "TLS handshake failed\n");
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        close(sock);
-        SSL_CTX_free(ctx);
+    SSL_CTX_set_cipher_list(ctx,
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-CHACHA20-POLY1305");
+
+    return ctx;
+}
+
+/* ============================================================================
+ * MAIN
+ * ============================================================================ */
+
+void usage(const char *prog) {
+    printf("TLS Mesh Client (Linux)\n\n");
+    printf("Usage:\n");
+    printf("  Parent: %s -i <ip> -p <port> -l <udp_port> [-t secs]\n", prog);
+    printf("  Child:  %s -P <ip:port> [-t secs]\n", prog);
+    printf("\nOptions:\n");
+    printf("  -i, --ip        Server IP (required for parent)\n");
+    printf("  -p, --port      Server port (required for parent)\n");
+    printf("  -l, --listen    UDP port for children (enables parent mode)\n");
+    printf("  -P, --parent    Parent address ip:port (enables child mode)\n");
+    printf("  -t, --interval  Send interval in seconds (default: 120)\n");
+    printf("  -h, --host      SNI hostname (default: www.microsoft.com)\n");
+}
+
+int main(int argc, char *argv[]) {
+    const char *server_ip = NULL;
+    int server_port = 0;
+    const char *host = "www.microsoft.com";
+    const char *ua = "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0";
+
+    /* Parse arguments */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--ip")) {
+            server_ip = argv[++i];
+        } else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--port")) {
+            server_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--listen")) {
+            listen_port = atoi(argv[++i]);
+            is_parent = 1;
+        } else if (!strcmp(argv[i], "-P") || !strcmp(argv[i], "--parent")) {
+            char *arg = argv[++i];
+            char *colon = strchr(arg, ':');
+            if (colon) {
+                strncpy(parent_ip, arg, colon - arg);
+                parent_port = atoi(colon + 1);
+                is_child = 1;
+            }
+        } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--interval")) {
+            interval = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--host")) {
+            host = argv[++i];
+        } else if (!strcmp(argv[i], "--help")) {
+            usage(argv[0]);
+            return 0;
+        }
+    }
+
+    /* Validate - must be either parent or child mode */
+    if (!is_child && !is_parent) {
+        printf("Error: Must specify either parent mode (-l) or child mode (-P)\n\n");
+        usage(argv[0]);
         return 1;
     }
 
-    printf("Connected to %s:%d\n", ip, port);
-    printf("Host: %s\n", host);
-    printf("User-Agent: %s\n", user_agent);
-    if (is_parent_mode) {
-        printf("Mode: PARENT (will listen for UDP on port %d)\n", listen_port);
-    } else {
-        printf("Mode: NORMAL\n");
-    }
-    printf("Sending HTTP requests every 10 seconds. Press Ctrl+C to stop.\n\n");
-
-    /* Get our own IP for peer table */
-    struct sockaddr_in local_addr;
-    socklen_t local_addr_len = sizeof(local_addr);
-    char my_ip[INET_ADDRSTRLEN] = "unknown";
-    if (getsockname(sock, (struct sockaddr *)&local_addr, &local_addr_len) == 0) {
-        inet_ntop(AF_INET, &local_addr.sin_addr, my_ip, sizeof(my_ip));
+    if (is_parent && (!server_ip || !server_port)) {
+        printf("Error: Parent mode requires -i and -p\n\n");
+        usage(argv[0]);
+        return 1;
     }
 
-    char request[4096];
-    char response[4096];
+    /* ========================================================================
+     * CHILD MODE: Send UDP telemetry to parent
+     * ======================================================================== */
+    if (is_child) {
+        printf("[CHILD] Target: %s:%d, Interval: %ds\n\n", parent_ip, parent_port, interval);
 
-    add_peer(my_ip, (long)time(NULL));
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in dest = {0};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(parent_port);
+        inet_pton(AF_INET, parent_ip, &dest.sin_addr);
 
-    /*
-     * Parent mode: Only send POST with peer table, no other communication
-     * Start UDP listener immediately
-     */
-    if (is_parent_mode) {
-        printf("\n*** PARENT MODE: POST-only communication ***\n");
+        /* Get our IP */
+        int tmp = socket(AF_INET, SOCK_DGRAM, 0);
+        connect(tmp, (struct sockaddr *)&dest, sizeof(dest));
+        struct sockaddr_in local;
+        socklen_t len = sizeof(local);
+        getsockname(tmp, (struct sockaddr *)&local, &len);
+        char my_ip[16];
+        inet_ntop(AF_INET, &local.sin_addr, my_ip, sizeof(my_ip));
+        close(tmp);
 
-        if (start_listener_thread() < 0) {
-            fprintf(stderr, "Failed to start listener thread\n");
+        char buf[256];
+        while (1) {
+            snprintf(buf, sizeof(buf), "{\"ip\":\"%s\",\"ts\":%ld}", my_ip, (long)time(NULL));
+            sendto(sock, buf, strlen(buf), 0, (struct sockaddr *)&dest, sizeof(dest));
+            printf("[>] %s\n", buf);
+            sleep(interval);
         }
+    }
+
+    /* ========================================================================
+     * PARENT MODE: TLS to server + UDP from children
+     * Each cycle: connect -> POST peers -> GET message -> disconnect
+     * ======================================================================== */
+    if (is_parent) {
+        printf("[PARENT] Server: %s:%d, UDP: %d, Interval: %ds\n\n",
+               server_ip, server_port, listen_port, interval);
+
+        SSL_CTX *ctx = create_tls_context();
+
+        pthread_t tid;
+        pthread_create(&tid, NULL, udp_listener, NULL);
+
+        peer_add("self", (long)time(NULL));
+
+        struct sockaddr_in server = {0};
+        server.sin_family = AF_INET;
+        server.sin_port = htons(server_port);
+        inet_pton(AF_INET, server_ip, &server.sin_addr);
+
+        char req[BUFFER_SIZE], res[BUFFER_SIZE], body[2048];
 
         while (1) {
-            char body[2048];
-            build_aggregated_json(body, sizeof(body));
+            printf("\n--- Cycle ---\n");
 
-            snprintf(request, sizeof(request),
+            /* Connect */
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
+                printf("[!] Connect failed\n");
+                close(sock);
+                sleep(interval);
+                continue;
+            }
+
+            /* Get our IP and add to peers */
+            struct sockaddr_in local;
+            socklen_t len = sizeof(local);
+            char my_ip[16];
+            if (getsockname(sock, (struct sockaddr *)&local, &len) == 0) {
+                inet_ntop(AF_INET, &local.sin_addr, my_ip, sizeof(my_ip));
+                peer_add(my_ip, (long)time(NULL));
+            }
+
+            /* TLS handshake */
+            SSL *ssl = SSL_new(ctx);
+            SSL_set_tlsext_host_name(ssl, host);
+            SSL_set_fd(ssl, sock);
+
+            if (SSL_connect(ssl) <= 0) {
+                printf("[!] TLS failed\n");
+                SSL_free(ssl);
+                close(sock);
+                sleep(interval);
+                continue;
+            }
+            printf("[+] TLS connected\n");
+
+            /* POST peer table */
+            peer_build_json(body, sizeof(body));
+            snprintf(req, sizeof(req),
                 "POST /api/v1/telemetry HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "User-Agent: %s\r\n"
+                "Host: %s\r\nUser-Agent: %s\r\n"
                 "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: keep-alive\r\n"
-                "\r\n"
-                "%s",
-                host, user_agent, (int)strlen(body), body);
+                "Content-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
+                host, ua, (int)strlen(body), body);
 
-            printf("[Parent] POST peer table: %s\n", body);
+            SSL_write(ssl, req, strlen(req));
+            printf("[>] POST %s\n", body);
 
-            int bytes = SSL_write(ssl, request, strlen(request));
-            if (bytes <= 0) {
-                fprintf(stderr, "SSL_write failed\n");
-                ERR_print_errors_fp(stderr);
-                break;
+            int n = SSL_read(ssl, res, sizeof(res) - 1);
+            if (n > 0) {
+                res[n] = '\0';
+                char *end = strchr(res, '\r');
+                if (end) *end = '\0';
+                printf("[<] %s\n", res);
             }
 
-            int resp_bytes = SSL_read(ssl, response, sizeof(response) - 1);
-            if (resp_bytes <= 0) {
-                fprintf(stderr, "SSL_read failed\n");
-                ERR_print_errors_fp(stderr);
-                break;
-            }
-            response[resp_bytes] = '\0';
+            /* GET message */
+            snprintf(req, sizeof(req),
+                "GET /api/v1/message HTTP/1.1\r\n"
+                "Host: %s\r\nUser-Agent: %s\r\n"
+                "Accept: application/json\r\nConnection: close\r\n\r\n",
+                host, ua);
 
-            char *newline = strchr(response, '\r');
-            if (newline) *newline = '\0';
-            printf("Response: %s\n", response);
-
-            print_peer_table();
-            printf("\n");
-
-            sleep(10);
-        }
-    } else {
-        /*
-         * Normal mode: alternating GET/POST requests
-         */
-        int request_num = 0;
-
-        while (1) {
-            char body[2048];
-
-            if (request_num % 2 == 0) {
-                /* GET request */
-                snprintf(request, sizeof(request),
-                    "GET /api/v1/status HTTP/1.1\r\n"
-                    "Host: %s\r\n"
-                    "User-Agent: %s\r\n"
-                    "Accept: application/json\r\n"
-                    "Connection: keep-alive\r\n"
-                    "\r\n",
-                    host, user_agent);
-            } else {
-                /* POST request */
-                snprintf(body, sizeof(body),
-                    "{\"status\":\"ok\",\"timestamp\":%ld,\"client_ip\":\"%s\"}",
-                    (long)time(NULL), my_ip);
-
-                snprintf(request, sizeof(request),
-                    "POST /api/v1/telemetry HTTP/1.1\r\n"
-                    "Host: %s\r\n"
-                    "User-Agent: %s\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: %d\r\n"
-                    "Connection: keep-alive\r\n"
-                    "\r\n"
-                    "%s",
-                    host, user_agent, (int)strlen(body), body);
+            SSL_write(ssl, req, strlen(req));
+            n = SSL_read(ssl, res, sizeof(res) - 1);
+            if (n > 0) {
+                res[n] = '\0';
+                /* Extract message from JSON */
+                char *msg = strstr(res, "\"message\":\"");
+                if (msg) {
+                    msg += 11;
+                    char *end = strchr(msg, '"');
+                    if (end) *end = '\0';
+                    printf("[MSG] %s\n", msg);
+                }
             }
 
-            int bytes = SSL_write(ssl, request, strlen(request));
-            if (bytes <= 0) {
-                fprintf(stderr, "SSL_write failed\n");
-                ERR_print_errors_fp(stderr);
-                break;
-            }
+            /* Disconnect */
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(sock);
+            printf("[-] Disconnected\n");
 
-            printf("Sent: %s request\n", (request_num % 2 == 0) ? "GET" : "POST");
-
-            int resp_bytes = SSL_read(ssl, response, sizeof(response) - 1);
-            if (resp_bytes <= 0) {
-                fprintf(stderr, "SSL_read failed\n");
-                ERR_print_errors_fp(stderr);
-                break;
-            }
-            response[resp_bytes] = '\0';
-
-            char *newline = strchr(response, '\r');
-            if (newline) *newline = '\0';
-            printf("Response: %s\n\n");
-
-            request_num++;
-            sleep(10);
+            peer_print();
+            sleep(interval);
         }
     }
-
-    listener_running = 0;
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(sock);
-    SSL_CTX_free(ctx);
-    MUTEX_DESTROY();
 
     return 0;
 }
