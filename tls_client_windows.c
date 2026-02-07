@@ -89,9 +89,7 @@ int is_child_mode = 0;
 int listen_port = 0;
 char parent_ip[64] = "";
 int parent_port = 0;
-
-/* Global SSL context for parent's child listener */
-SSL_CTX *child_listener_ctx = NULL;
+int child_interval = 120;  /* UDP send interval in seconds (default: 120) */
 
 /* Flag to signal listener thread to stop */
 volatile int listener_running = 1;
@@ -169,86 +167,40 @@ void print_usage(const char *program_name) {
     fprintf(stderr, "\nRequired (for child mode):\n");
     fprintf(stderr, "  --parent, -P <ip:port>  Connect to parent instead of server\n");
     fprintf(stderr, "\nOptional:\n");
-    fprintf(stderr, "  --host, -h <name>    Hostname for SNI and Host header\n");
-    fprintf(stderr, "  --ua,   -u <string>  User-Agent string\n");
-    fprintf(stderr, "  --listen, -l <port>  Listen port for children (enables parent mode)\n");
-    fprintf(stderr, "  --help               Show this help message\n");
+    fprintf(stderr, "  --host, -h <name>       Hostname for SNI and Host header\n");
+    fprintf(stderr, "  --ua,   -u <string>     User-Agent string\n");
+    fprintf(stderr, "  --listen, -l <port>     Listen port for children (enables parent mode)\n");
+    fprintf(stderr, "  --interval, -t <secs>   UDP send interval for child mode (default: 120)\n");
+    fprintf(stderr, "  --help                  Show this help message\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s --ip 127.0.0.1 --port 4433\n", program_name);
     fprintf(stderr, "  %s -i 127.0.0.1 -p 4433 -l 4434  (parent mode)\n", program_name);
-    fprintf(stderr, "  %s -P 127.0.0.1:4434             (child mode)\n", program_name);
+    fprintf(stderr, "  %s -P 127.0.0.1:4434             (child mode, 120s interval)\n", program_name);
+    fprintf(stderr, "  %s -P 127.0.0.1:4434 -t 5        (child mode, 5s interval)\n", program_name);
 }
 
 /*
  * ============================================================================
- * HELPER FUNCTION: Handle a single child connection
+ * UDP LISTENER: Receive child telemetry (Parent Mode)
  * ============================================================================
+ *
+ * Children send simple JSON datagrams:
+ *   {"ip":"192.168.1.5","ts":1234567890}
+ *
+ * No acknowledgment - fire and forget.
  */
-void handle_child_connection(SSL *ssl, const char *child_ip) {
-    char buffer[4096];
-    char response[1024];
-
-    while (listener_running) {
-        int bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
-        if (bytes <= 0) {
-            break;
-        }
-        buffer[bytes] = '\0';
-
-        char *method_end = strchr(buffer, ' ');
-        if (!method_end) continue;
-
-        int is_post = (strncmp(buffer, "POST", 4) == 0);
-        printf("[Child %s] %s request\n", child_ip, is_post ? "POST" : "GET");
-
-        if (is_post) {
-            char *body_start = strstr(buffer, "\r\n\r\n");
-            if (body_start) {
-                body_start += 4;
-                printf("[Child %s] Body: %s\n", child_ip, body_start);
-
-                char *ts_ptr = strstr(body_start, "\"timestamp\":");
-                long timestamp = (long)time(NULL);
-                if (ts_ptr) {
-                    timestamp = atol(ts_ptr + 12);
-                }
-
-                add_peer(child_ip, timestamp);
-                print_peer_table();
-            }
-        }
-
-        const char *resp_body = "{\"received\":true}";
-        snprintf(response, sizeof(response),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n"
-            "%s",
-            (int)strlen(resp_body), resp_body);
-
-        SSL_write(ssl, response, strlen(response));
-    }
-
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-}
 
 /*
  * ============================================================================
- * LISTENER THREAD: Accept child connections (Parent Mode)
+ * UDP LISTENER THREAD: Receive child datagrams (Parent Mode)
  * ============================================================================
  */
 DWORD WINAPI listener_thread(LPVOID arg) {
-    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock < 0) {
-        fprintf(stderr, "Failed to create listener socket\n");
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        fprintf(stderr, "Failed to create UDP socket\n");
         return 0;
     }
-
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in listen_addr;
     memset(&listen_addr, 0, sizeof(listen_addr));
@@ -256,84 +208,55 @@ DWORD WINAPI listener_thread(LPVOID arg) {
     listen_addr.sin_addr.s_addr = INADDR_ANY;
     listen_addr.sin_port = htons(listen_port);
 
-    if (bind(listen_sock, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
-        fprintf(stderr, "Failed to bind listener on port %d\n", listen_port);
-        closesocket(listen_sock);
+    if (bind(udp_sock, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        fprintf(stderr, "Failed to bind UDP on port %d\n", listen_port);
+        closesocket(udp_sock);
         return 0;
     }
 
-    if (listen(listen_sock, 5) < 0) {
-        fprintf(stderr, "Failed to listen on port %d\n", listen_port);
-        closesocket(listen_sock);
-        return 0;
-    }
+    printf("[Parent] Listening for UDP datagrams on port %d\n", listen_port);
 
-    printf("[Parent] Listening for children on port %d\n", listen_port);
-
+    char buffer[1024];
     while (listener_running) {
         struct sockaddr_in child_addr;
         socklen_t child_len = sizeof(child_addr);
-        int child_sock = accept(listen_sock, (struct sockaddr *)&child_addr, &child_len);
 
-        if (child_sock < 0) {
-            if (listener_running) {
-                fprintf(stderr, "Accept failed\n");
-            }
-            continue;
-        }
+        int bytes = recvfrom(udp_sock, buffer, sizeof(buffer) - 1, 0,
+                             (struct sockaddr *)&child_addr, &child_len);
+        if (bytes <= 0) continue;
+
+        buffer[bytes] = '\0';
 
         char child_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &child_addr.sin_addr, child_ip, sizeof(child_ip));
-        printf("[Parent] Child connected from %s\n", child_ip);
 
-        SSL *child_ssl = SSL_new(child_listener_ctx);
-        SSL_set_fd(child_ssl, child_sock);
-
-        if (SSL_accept(child_ssl) <= 0) {
-            fprintf(stderr, "TLS handshake with child failed\n");
-            ERR_print_errors_fp(stderr);
-            SSL_free(child_ssl);
-            closesocket(child_sock);
-            continue;
+        /* Parse timestamp from JSON: {"ip":"...","ts":1234567890} */
+        char *ts_ptr = strstr(buffer, "\"ts\":");
+        long timestamp = (long)time(NULL);
+        if (ts_ptr) {
+            timestamp = atol(ts_ptr + 5);
         }
 
-        handle_child_connection(child_ssl, child_ip);
-        closesocket(child_sock);
+        printf("[Parent] UDP from %s: %s\n", child_ip, buffer);
+        add_peer(child_ip, timestamp);
+        print_peer_table();
     }
 
-    closesocket(listen_sock);
+    closesocket(udp_sock);
     return 0;
 }
 
 /*
  * ============================================================================
- * HELPER FUNCTION: Start listener thread for parent mode
+ * HELPER FUNCTION: Start UDP listener thread for parent mode
  * ============================================================================
  */
 int start_listener_thread(void) {
-    child_listener_ctx = SSL_CTX_new(TLS_server_method());
-    if (!child_listener_ctx) {
-        fprintf(stderr, "Failed to create child listener SSL context\n");
-        return -1;
-    }
-
-    if (SSL_CTX_use_certificate_file(child_listener_ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
-        fprintf(stderr, "Failed to load cert.pem for listener\n");
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    if (SSL_CTX_use_PrivateKey_file(child_listener_ctx, "key.pem", SSL_FILETYPE_PEM) <= 0) {
-        fprintf(stderr, "Failed to load key.pem for listener\n");
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-
     HANDLE thread = CreateThread(NULL, 0, listener_thread, NULL, 0, NULL);
     if (thread == NULL) {
         fprintf(stderr, "Failed to create listener thread\n");
         return -1;
     }
-
     return 0;
 }
 
@@ -395,6 +318,15 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--interval") == 0 || strcmp(argv[i], "-t") == 0) {
+            if (i + 1 < argc) {
+                child_interval = atoi(argv[++i]);
+                if (child_interval < 1) child_interval = 1;
+            } else {
+                fprintf(stderr, "Error: %s requires a value\n", argv[i]);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--parent") == 0 || strcmp(argv[i], "-P") == 0) {
             if (i + 1 < argc) {
                 char *parent_arg = argv[++i];
@@ -423,16 +355,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* Validate required arguments */
-    if (is_child_mode) {
-        ip = parent_ip;
-        port = parent_port;
-    } else if (ip == NULL || port == 0) {
+    if (!is_child_mode && (ip == NULL || port == 0)) {
         fprintf(stderr, "Error: --ip and --port are required (or use --parent for child mode)\n\n");
         print_usage(argv[0]);
         return 1;
     }
-
-    MUTEX_INIT();
 
     /* Initialize Winsock */
     WSADATA wsa;
@@ -440,6 +367,59 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "WSAStartup failed\n");
         return 1;
     }
+
+    /*
+     * ========================================================================
+     * CHILD MODE: Simple UDP sender (no TLS, no HTTP)
+     * ========================================================================
+     */
+    if (is_child_mode) {
+        printf("Mode: CHILD (UDP to parent %s:%d)\n", parent_ip, parent_port);
+        printf("Sending UDP telemetry every %d seconds. Press Ctrl+C to stop.\n\n", child_interval);
+
+        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_sock < 0) {
+            fprintf(stderr, "Failed to create UDP socket\n");
+            WSACleanup();
+            return 1;
+        }
+
+        struct sockaddr_in parent_addr;
+        memset(&parent_addr, 0, sizeof(parent_addr));
+        parent_addr.sin_family = AF_INET;
+        parent_addr.sin_port = htons(parent_port);
+        inet_pton(AF_INET, parent_ip, &parent_addr.sin_addr);
+
+        /* Get our local IP */
+        int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        connect(temp_sock, (struct sockaddr *)&parent_addr, sizeof(parent_addr));
+        struct sockaddr_in local_addr;
+        socklen_t local_len = sizeof(local_addr);
+        getsockname(temp_sock, (struct sockaddr *)&local_addr, &local_len);
+        char my_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &local_addr.sin_addr, my_ip, sizeof(my_ip));
+        closesocket(temp_sock);
+
+        char buffer[256];
+        while (1) {
+            snprintf(buffer, sizeof(buffer), "{\"ip\":\"%s\",\"ts\":%ld}", my_ip, (long)time(NULL));
+            sendto(udp_sock, buffer, strlen(buffer), 0,
+                   (struct sockaddr *)&parent_addr, sizeof(parent_addr));
+            printf("[Child] Sent: %s\n", buffer);
+            Sleep(child_interval * 1000);
+        }
+
+        closesocket(udp_sock);
+        WSACleanup();
+        return 0;
+    }
+
+    /*
+     * ========================================================================
+     * PARENT/NORMAL MODE: TLS connection to server
+     * ========================================================================
+     */
+    MUTEX_INIT();
 
     /* Initialize OpenSSL */
     SSL_library_init();
@@ -546,10 +526,8 @@ int main(int argc, char *argv[]) {
     printf("Connected to %s:%d\n", ip, port);
     printf("Host: %s\n", host);
     printf("User-Agent: %s\n", user_agent);
-    if (is_child_mode) {
-        printf("Mode: CHILD (connecting to parent)\n");
-    } else if (is_parent_mode) {
-        printf("Mode: PARENT (will listen for children on port %d)\n", listen_port);
+    if (is_parent_mode) {
+        printf("Mode: PARENT (will listen for UDP on port %d)\n", listen_port);
     } else {
         printf("Mode: NORMAL\n");
     }
@@ -573,25 +551,8 @@ int main(int argc, char *argv[]) {
     while (1) {
         char body[2048];
 
-        if (is_child_mode) {
-            snprintf(body, sizeof(body),
-                "{\"status\":\"ok\",\"timestamp\":%ld,\"client_ip\":\"%s\"}",
-                (long)time(NULL), my_ip);
-
-            snprintf(request, sizeof(request),
-                "POST /api/v1/telemetry HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "User-Agent: %s\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: keep-alive\r\n"
-                "\r\n"
-                "%s",
-                host, user_agent, (int)strlen(body), body);
-
-            printf("[Child] Sending telemetry to parent\n");
-
-        } else if (is_parent_mode && got_parent_role) {
+        if (is_parent_mode && got_parent_role) {
+            /* Parent mode: aggregate child data and forward to server */
             build_aggregated_json(body, sizeof(body));
 
             snprintf(request, sizeof(request),
@@ -608,6 +569,7 @@ int main(int argc, char *argv[]) {
             printf("[Parent] Sending aggregated data to server: %s\n", body);
 
         } else if (request_num % 2 == 0) {
+            /* GET request */
             snprintf(request, sizeof(request),
                 "GET /api/v1/status HTTP/1.1\r\n"
                 "Host: %s\r\n"
@@ -618,6 +580,7 @@ int main(int argc, char *argv[]) {
                 host, user_agent);
 
         } else {
+            /* POST request */
             snprintf(body, sizeof(body),
                 "{\"status\":\"ok\",\"timestamp\":%ld,\"client_ip\":\"%s\"}",
                 (long)time(NULL), my_ip);
@@ -641,7 +604,7 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        if (!is_child_mode && !got_parent_role) {
+        if (!got_parent_role) {
             printf("Sent: %s request\n", (request_num % 2 == 0) ? "GET" : "POST");
         }
 
@@ -688,11 +651,6 @@ int main(int argc, char *argv[]) {
     SSL_free(ssl);
     closesocket(sock);
     SSL_CTX_free(ctx);
-
-    if (child_listener_ctx) {
-        SSL_CTX_free(child_listener_ctx);
-    }
-
     MUTEX_DESTROY();
     WSACleanup();
 
