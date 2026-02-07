@@ -239,8 +239,13 @@ context.sni_callback = sni_callback
 # STEP 8: START SERVER
 # ==============================================================================
 
+print("=" * 60, flush=True)
+print("  TLS MESH SERVER v2.0 - WITH PARENT ASSIGNMENT", flush=True)
+print("=" * 60, flush=True)
 print(f"Server listening on {HOST}:{PORT}", flush=True)
+print(f"Parent assigned: {is_parent_assigned}", flush=True)
 print("Press Ctrl+C to stop", flush=True)
+print("=" * 60, flush=True)
 
 # ==============================================================================
 # STEP 9: MAIN SERVER LOOP
@@ -331,6 +336,8 @@ try:
                 if not data:
                     # Empty data means the client closed the connection
                     break
+
+                print(f"  [RECV] Got {len(data)} bytes", flush=True)
 
                 # ----------------------------------------------------------
                 # PARSE HTTP REQUEST
@@ -436,10 +443,9 @@ try:
                 #   Content-Type - MIME type of response body
                 #   Connection - keep-alive or close
 
-                # Access the global parent assignment flag
-                global is_parent_assigned
-
                 # Choose response based on request method and mesh state
+                print(f"  [Debug] method={method}, is_parent_assigned={is_parent_assigned}", flush=True)
+
                 if method == 'GET':
                     # First connection becomes the parent node
                     if not is_parent_assigned:
@@ -450,12 +456,14 @@ try:
                             "role": "parent",
                             "listen_port": 4434
                         })
-                        print(f"  Assigned as PARENT node", flush=True)
+                        print(f"  >>> ASSIGNED AS PARENT NODE <<<", flush=True)
+                        print(f"  Response body: {response_body}", flush=True)
                     else:
                         response_body = json.dumps({
                             "status": "healthy",
                             "version": "1.0"
                         })
+                        print(f"  Response body: {response_body}", flush=True)
                 else:
                     # For POST responses, include peer table for parent
                     peer_list = [{"ip": ip, "timestamp": data["timestamp"]}

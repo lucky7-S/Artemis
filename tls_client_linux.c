@@ -601,14 +601,21 @@ int main(int argc, char *argv[]) {
         }
         response[resp_bytes] = '\0';
 
+        /* Parse response - find body first, before modifying buffer */
         char *body_start = strstr(response, "\r\n\r\n");
-        char *resp_body = body_start ? body_start + 4 : "";
 
+        /* Check for parent role in body BEFORE we modify the buffer */
+        int has_parent_role = 0;
+        if (body_start && strstr(body_start + 4, "\"role\":\"parent\"")) {
+            has_parent_role = 1;
+        }
+
+        /* Now safe to modify for display */
         char *newline = strchr(response, '\r');
         if (newline) *newline = '\0';
         printf("Response: %s\n", response);
 
-        if (is_parent_mode && !got_parent_role && strstr(resp_body, "\"role\":\"parent\"")) {
+        if (is_parent_mode && !got_parent_role && has_parent_role) {
             printf("\n*** ASSIGNED AS PARENT NODE ***\n");
             got_parent_role = 1;
 
@@ -618,11 +625,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (is_parent_mode && got_parent_role) {
-            char *pt_start = strstr(resp_body, "\"peer_table\":");
-            if (pt_start) {
-                printf("Received peer table from server\n");
-                print_peer_table();
-            }
+            print_peer_table();
         }
 
         printf("\n");
