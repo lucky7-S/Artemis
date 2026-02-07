@@ -32,6 +32,7 @@ import sys
 HOST = '0.0.0.0'        # IP to bind to ('0.0.0.0' for all interfaces)
 PORT = 4433             # Port to listen on
 MESSAGE_FILE = 'server_message.txt'  # File containing message for clients
+STATE_FILE = 'server_state.json'     # State file for web interface
 
 # Parse command line arguments
 i = 1
@@ -54,6 +55,20 @@ while i < len(sys.argv):
 # =============================================================================
 
 peer_table = {}  # Master peer table: {ip: {"timestamp": ..., "active": True}}
+parent_ip = None
+last_contact = 0
+
+def save_state():
+    """Write state to file for web interface."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({
+                'peers': peer_table,
+                'parent_ip': parent_ip,
+                'last_contact': last_contact
+            }, f)
+    except:
+        pass
 
 def get_message():
     """Read message from file, or return default if file doesn't exist."""
@@ -126,6 +141,10 @@ try:
 
                 # Handle POST - receive peer table from parent
                 if method == 'POST':
+                    global parent_ip, last_contact
+                    parent_ip = addr[0]
+                    last_contact = int(time.time())
+
                     body_start = request.find('\r\n\r\n')
                     if body_start != -1:
                         body = request[body_start + 4:]
@@ -141,6 +160,7 @@ try:
                         except json.JSONDecodeError:
                             pass
 
+                    save_state()
                     response_body = json.dumps({
                         "received": True,
                         "peers_count": len(peer_table)
