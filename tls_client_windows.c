@@ -305,8 +305,6 @@ int main(int argc, char *argv[]) {
         SSL_CTX *ctx = create_tls_context();
         CreateThread(NULL, 0, udp_listener, NULL, 0, NULL);
 
-        peer_add("self", (long)time(NULL));
-
         struct sockaddr_in server = {0};
         server.sin_family = AF_INET;
         server.sin_port = htons(server_port);
@@ -386,7 +384,9 @@ int main(int argc, char *argv[]) {
                     msg += 11;
                     char *end = strchr(msg, '"');
                     if (end) *end = '\0';
-                    printf("[MSG] %s\n", msg);
+                    printf("\n========================================\n");
+                    printf("  SERVER MESSAGE: %s\n", msg);
+                    printf("========================================\n");
                 }
             }
 

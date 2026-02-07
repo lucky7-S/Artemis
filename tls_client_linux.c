@@ -300,8 +300,6 @@ int main(int argc, char *argv[]) {
         pthread_t tid;
         pthread_create(&tid, NULL, udp_listener, NULL);
 
-        peer_add("self", (long)time(NULL));
-
         struct sockaddr_in server = {0};
         server.sin_family = AF_INET;
         server.sin_port = htons(server_port);
@@ -381,7 +379,9 @@ int main(int argc, char *argv[]) {
                     msg += 11;
                     char *end = strchr(msg, '"');
                     if (end) *end = '\0';
-                    printf("[MSG] %s\n", msg);
+                    printf("\n========================================\n");
+                    printf("  SERVER MESSAGE: %s\n", msg);
+                    printf("========================================\n");
                 }
             }
 
