@@ -18,6 +18,10 @@ STATE_FILE = 'server_state.json'
 MESSAGE_FILE = 'server_message.txt'
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 
+# Track previous timestamps to calculate intervals
+previous_timestamps = {}
+previous_parent_contact = 0
+
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
@@ -35,6 +39,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 border: none; cursor: pointer; font-family: monospace; }}
         button:hover {{ background: #0a0; }}
         .status {{ padding: 10px; margin: 10px 0; background: #333; }}
+        .diagram {{ background: #222; padding: 20px; margin: 20px 0; text-align: center; }}
+        .node {{ display: inline-block; border: 2px solid #0f0; padding: 8px 16px; margin: 5px; }}
+        .server {{ border-color: #0ff; color: #0ff; }}
+        .parent {{ border-color: #0f0; }}
+        .child {{ font-size: 12px; }}
+        .windows {{ border-color: #0af; color: #0af; }}
+        .linux {{ border-color: #f80; color: #f80; }}
+        .line {{ color: #555; }}
     </style>
 </head>
 <body>
@@ -46,9 +58,21 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <strong>Total Peers:</strong> {peer_count}
     </div>
 
+    <h2>Network Topology</h2>
+    <div class="diagram">
+        <div class="node server">SERVER</div>
+        <div class="line">|</div>
+        <div class="node parent">{parent_ip}</div>
+        {child_diagram}
+        <div style="margin-top:15px; font-size:11px; color:#666;">
+            <span style="color:#0af;">[W] Windows</span> &nbsp;
+            <span style="color:#f80;">[L] Linux</span>
+        </div>
+    </div>
+
     <h2>Peer Table</h2>
     <table>
-        <tr><th>IP Address</th><th>Hostname</th><th>OS</th><th>Last Seen</th></tr>
+        <tr><th>IP Address</th><th>Hostname</th><th>OS</th><th>Last Seen</th><th>Interval</th></tr>
         {peer_rows}
     </table>
 
@@ -105,6 +129,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Build peer rows
         from datetime import datetime
+        global previous_timestamps
         peers = state.get('peers', {})
         rows = ""
         for ip, data in peers.items():
@@ -112,22 +137,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
             hostname = data.get('hostname', 'unknown')
             os_info = data.get('os', 'unknown')
             time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else 'Never'
-            rows += f"<tr><td>{ip}</td><td>{hostname}</td><td>{os_info}</td><td>{time_str}</td></tr>\n"
+
+            # Calculate interval from previous timestamp
+            interval_str = "-"
+            if ip in previous_timestamps and ts > 0:
+                interval = ts - previous_timestamps[ip]
+                if interval > 0:
+                    interval_str = f"{interval}s"
+
+            # Store current timestamp for next calculation
+            if ts > 0:
+                previous_timestamps[ip] = ts
+
+            rows += f"<tr><td>{ip}</td><td>{hostname}</td><td>{os_info}</td><td>{time_str}</td><td>{interval_str}</td></tr>\n"
 
         if not rows:
-            rows = "<tr><td colspan='4'>No peers connected</td></tr>"
+            rows = "<tr><td colspan='5'>No peers connected</td></tr>"
 
         # Parent info
         parent_ip = state.get('parent_ip', 'None')
         last_contact = state.get('last_contact', 0)
         parent_time = datetime.fromtimestamp(last_contact).strftime('%Y-%m-%d %H:%M:%S') if last_contact else 'Never'
 
+        # Build child diagram
+        child_diagram = ""
+        if peers:
+            child_diagram = '<div class="line">'
+            for ip in peers:
+                child_diagram += " | "
+            child_diagram += '</div><div>'
+            for ip, data in peers.items():
+                os_info = data.get('os', '').lower()
+                if 'windows' in os_info:
+                    os_class = 'windows'
+                    os_label = 'W'
+                else:
+                    os_class = 'linux'
+                    os_label = 'L'
+                child_diagram += f'<span class="node child {os_class}">[{os_label}] {ip}</span>'
+            child_diagram += '</div>'
+
         return HTML_TEMPLATE.format(
             parent_ip=parent_ip,
             parent_time=parent_time,
             peer_count=len(peers),
             peer_rows=rows,
-            current_message=message
+            current_message=message,
+            child_diagram=child_diagram
         )
 
 print(f"Web interface running on http://localhost:{PORT}")
