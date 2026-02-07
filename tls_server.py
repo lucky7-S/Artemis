@@ -141,7 +141,6 @@ try:
 
                 # Handle POST - receive peer table from parent
                 if method == 'POST':
-                    global parent_ip, last_contact
                     parent_ip = addr[0]
                     last_contact = int(time.time())
 
