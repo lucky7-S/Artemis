@@ -326,14 +326,8 @@ int main(int argc, char *argv[]) {
         char hostname[256] = "unknown";
         gethostname(hostname, sizeof(hostname));
 
-        /* Get OS version */
+        /* OS info - keep it simple to avoid deprecated API warnings */
         char os_info[128] = "Windows";
-        OSVERSIONINFOA osvi;
-        osvi.dwOSVersionInfoSize = sizeof(osvi);
-        if (GetVersionExA(&osvi)) {
-            snprintf(os_info, sizeof(os_info), "Windows %lu.%lu",
-                     osvi.dwMajorVersion, osvi.dwMinorVersion);
-        }
 
         char buf[512];
         while (1) {
@@ -366,12 +360,6 @@ int main(int argc, char *argv[]) {
         char my_hostname[256] = "unknown";
         char my_os[128] = "Windows";
         gethostname(my_hostname, sizeof(my_hostname));
-        OSVERSIONINFOA osvi;
-        osvi.dwOSVersionInfoSize = sizeof(osvi);
-        if (GetVersionExA(&osvi)) {
-            snprintf(my_os, sizeof(my_os), "Windows %lu.%lu",
-                     osvi.dwMajorVersion, osvi.dwMinorVersion);
-        }
 
         char req[BUFFER_SIZE], res[BUFFER_SIZE], body[2048];
         char my_ip[16] = "";

@@ -175,7 +175,7 @@ try:
                 # Handle GET - return configurable message
                 elif method == 'GET':
                     msg = get_message()
-                    response_body = json.dumps({"message": msg})
+                    response_body = json.dumps({"message": msg}, separators=(',', ':'))
                     print(f"    Message: {msg}")
 
                 else:
