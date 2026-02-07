@@ -18,23 +18,23 @@ STATE_FILE = 'server_state.json'
 MESSAGE_FILE = 'server_message.txt'
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 
-HTML = '''<!DOCTYPE html>
+HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
     <title>Mesh Server Control</title>
     <meta http-equiv="refresh" content="5">
     <style>
-        body { font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; }
-        h1 { color: #0f0; }
-        table { border-collapse: collapse; margin: 20px 0; }
-        th, td { border: 1px solid #0f0; padding: 8px 16px; text-align: left; }
-        th { background: #0f0; color: #1a1a1a; }
-        input[type=text] { width: 400px; padding: 8px; font-family: monospace;
-                          background: #333; color: #0f0; border: 1px solid #0f0; }
-        button { padding: 8px 16px; background: #0f0; color: #1a1a1a;
-                border: none; cursor: pointer; font-family: monospace; }
-        button:hover { background: #0a0; }
-        .status { padding: 10px; margin: 10px 0; background: #333; }
+        body {{ font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; }}
+        h1 {{ color: #0f0; }}
+        table {{ border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ border: 1px solid #0f0; padding: 8px 16px; text-align: left; }}
+        th {{ background: #0f0; color: #1a1a1a; }}
+        input[type=text] {{ width: 400px; padding: 8px; font-family: monospace;
+                          background: #333; color: #0f0; border: 1px solid #0f0; }}
+        button {{ padding: 8px 16px; background: #0f0; color: #1a1a1a;
+                border: none; cursor: pointer; font-family: monospace; }}
+        button:hover {{ background: #0a0; }}
+        .status {{ padding: 10px; margin: 10px 0; background: #333; }}
     </style>
 </head>
 <body>
@@ -120,7 +120,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         last_contact = state.get('last_contact', 0)
         parent_time = datetime.fromtimestamp(last_contact).strftime('%Y-%m-%d %H:%M:%S') if last_contact else 'Never'
 
-        return HTML.format(
+        return HTML_TEMPLATE.format(
             parent_ip=parent_ip,
             parent_time=parent_time,
             peer_count=len(peers),
