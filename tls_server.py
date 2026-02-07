@@ -154,7 +154,14 @@ try:
                                 for client in data['clients']:
                                     ip = client.get('ip', 'unknown')
                                     ts = client.get('timestamp', int(time.time()))
-                                    peer_table[ip] = {"timestamp": ts, "active": True}
+                                    hostname = client.get('hostname', 'unknown')
+                                    os_info = client.get('os', 'unknown')
+                                    peer_table[ip] = {
+                                        "timestamp": ts,
+                                        "hostname": hostname,
+                                        "os": os_info,
+                                        "active": True
+                                    }
                                 print(f"    Peers: {list(peer_table.keys())}")
                         except json.JSONDecodeError:
                             pass

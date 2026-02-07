@@ -43,6 +43,8 @@ typedef int socklen_t;
 
 typedef struct {
     char ip[16];
+    char hostname[64];
+    char os[64];
     long timestamp;
     int active;
 } Peer;
@@ -52,12 +54,14 @@ int peer_count = 0;
 CRITICAL_SECTION peer_mutex;
 
 /* Thread-safe peer table operations */
-void peer_add(const char *ip, long ts) {
+void peer_add(const char *ip, const char *hostname, const char *os, long ts) {
     EnterCriticalSection(&peer_mutex);
 
     /* Update existing peer */
     for (int i = 0; i < peer_count; i++) {
         if (strcmp(peer_table[i].ip, ip) == 0) {
+            if (hostname) strncpy(peer_table[i].hostname, hostname, 63);
+            if (os) strncpy(peer_table[i].os, os, 63);
             peer_table[i].timestamp = ts;
             peer_table[i].active = 1;
             LeaveCriticalSection(&peer_mutex);
@@ -69,6 +73,10 @@ void peer_add(const char *ip, long ts) {
     if (peer_count < MAX_PEERS) {
         strncpy(peer_table[peer_count].ip, ip, 15);
         peer_table[peer_count].ip[15] = '\0';
+        strncpy(peer_table[peer_count].hostname, hostname ? hostname : "unknown", 63);
+        peer_table[peer_count].hostname[63] = '\0';
+        strncpy(peer_table[peer_count].os, os ? os : "unknown", 63);
+        peer_table[peer_count].os[63] = '\0';
         peer_table[peer_count].timestamp = ts;
         peer_table[peer_count].active = 1;
         peer_count++;
@@ -84,8 +92,10 @@ int peer_build_json(char *buf, size_t len) {
     int n = snprintf(buf, len, "{\"clients\":[");
     for (int i = 0; i < peer_count; i++) {
         if (i > 0) n += snprintf(buf + n, len - n, ",");
-        n += snprintf(buf + n, len - n, "{\"ip\":\"%s\",\"timestamp\":%ld}",
-                      peer_table[i].ip, peer_table[i].timestamp);
+        n += snprintf(buf + n, len - n,
+            "{\"ip\":\"%s\",\"hostname\":\"%s\",\"os\":\"%s\",\"timestamp\":%ld}",
+            peer_table[i].ip, peer_table[i].hostname, peer_table[i].os,
+            peer_table[i].timestamp);
     }
     n += snprintf(buf + n, len - n, "]}");
 
@@ -97,7 +107,9 @@ void peer_print(void) {
     EnterCriticalSection(&peer_mutex);
     printf("\n=== Peers (%d) ===\n", peer_count);
     for (int i = 0; i < peer_count; i++) {
-        printf("  %s @ %ld\n", peer_table[i].ip, peer_table[i].timestamp);
+        printf("  %s | %s | %s | %ld\n",
+            peer_table[i].ip, peer_table[i].hostname,
+            peer_table[i].os, peer_table[i].timestamp);
     }
     printf("==================\n");
     LeaveCriticalSection(&peer_mutex);
@@ -150,13 +162,38 @@ DWORD WINAPI udp_listener(LPVOID arg) {
         char ip[16];
         inet_ntop(AF_INET, &src.sin_addr, ip, sizeof(ip));
 
-        /* Parse timestamp from {"ip":"...","ts":123} */
+        /* Parse JSON fields */
         long ts = (long)time(NULL);
-        char *p = strstr(buf, "\"ts\":");
-        if (p) ts = atol(p + 5);
+        char hostname[64] = "unknown";
+        char os[64] = "unknown";
 
-        printf("[UDP] %s: %s\n", ip, buf);
-        peer_add(ip, ts);
+        char *p;
+        if ((p = strstr(buf, "\"ts\":")) != NULL) ts = atol(p + 5);
+
+        if ((p = strstr(buf, "\"hostname\":\"")) != NULL) {
+            p += 12;
+            char *end = strchr(p, '"');
+            if (end) {
+                size_t len = end - p;
+                if (len > 63) len = 63;
+                strncpy(hostname, p, len);
+                hostname[len] = '\0';
+            }
+        }
+
+        if ((p = strstr(buf, "\"os\":\"")) != NULL) {
+            p += 6;
+            char *end = strchr(p, '"');
+            if (end) {
+                size_t len = end - p;
+                if (len > 63) len = 63;
+                strncpy(os, p, len);
+                os[len] = '\0';
+            }
+        }
+
+        printf("[UDP] %s (%s, %s)\n", ip, hostname, os);
+        peer_add(ip, hostname, os, ts);
         peer_print();
     }
 
@@ -285,9 +322,24 @@ int main(int argc, char *argv[]) {
         inet_ntop(AF_INET, &local.sin_addr, my_ip, sizeof(my_ip));
         closesocket(tmp);
 
-        char buf[256];
+        /* Get hostname */
+        char hostname[256] = "unknown";
+        gethostname(hostname, sizeof(hostname));
+
+        /* Get OS version */
+        char os_info[128] = "Windows";
+        OSVERSIONINFOA osvi;
+        osvi.dwOSVersionInfoSize = sizeof(osvi);
+        if (GetVersionExA(&osvi)) {
+            snprintf(os_info, sizeof(os_info), "Windows %lu.%lu",
+                     osvi.dwMajorVersion, osvi.dwMinorVersion);
+        }
+
+        char buf[512];
         while (1) {
-            snprintf(buf, sizeof(buf), "{\"ip\":\"%s\",\"ts\":%ld}", my_ip, (long)time(NULL));
+            snprintf(buf, sizeof(buf),
+                "{\"ip\":\"%s\",\"hostname\":\"%s\",\"os\":\"%s\",\"ts\":%ld}",
+                my_ip, hostname, os_info, (long)time(NULL));
             sendto(sock, buf, strlen(buf), 0, (struct sockaddr *)&dest, sizeof(dest));
             printf("[>] %s\n", buf);
             Sleep(interval * 1000);
@@ -310,7 +362,19 @@ int main(int argc, char *argv[]) {
         server.sin_port = htons(server_port);
         inet_pton(AF_INET, server_ip, &server.sin_addr);
 
+        /* Get hostname and OS once at startup */
+        char my_hostname[256] = "unknown";
+        char my_os[128] = "Windows";
+        gethostname(my_hostname, sizeof(my_hostname));
+        OSVERSIONINFOA osvi;
+        osvi.dwOSVersionInfoSize = sizeof(osvi);
+        if (GetVersionExA(&osvi)) {
+            snprintf(my_os, sizeof(my_os), "Windows %lu.%lu",
+                     osvi.dwMajorVersion, osvi.dwMinorVersion);
+        }
+
         char req[BUFFER_SIZE], res[BUFFER_SIZE], body[2048];
+        char my_ip[16] = "";
 
         while (1) {
             printf("\n--- Cycle ---\n");
@@ -327,10 +391,9 @@ int main(int argc, char *argv[]) {
             /* Get our IP and add to peers */
             struct sockaddr_in local;
             socklen_t len = sizeof(local);
-            char my_ip[16];
             if (getsockname(sock, (struct sockaddr *)&local, &len) == 0) {
                 inet_ntop(AF_INET, &local.sin_addr, my_ip, sizeof(my_ip));
-                peer_add(my_ip, (long)time(NULL));
+                peer_add(my_ip, my_hostname, my_os, (long)time(NULL));
             }
 
             /* TLS handshake */
@@ -374,19 +437,32 @@ int main(int argc, char *argv[]) {
                 "Accept: application/json\r\nConnection: close\r\n\r\n",
                 host, ua);
 
-            SSL_write(ssl, req, strlen(req));
-            n = SSL_read(ssl, res, sizeof(res) - 1);
-            if (n > 0) {
-                res[n] = '\0';
-                /* Extract message from JSON */
-                char *msg = strstr(res, "\"message\":\"");
-                if (msg) {
-                    msg += 11;
-                    char *end = strchr(msg, '"');
-                    if (end) *end = '\0';
-                    printf("\n========================================\n");
-                    printf("  SERVER MESSAGE: %s\n", msg);
-                    printf("========================================\n");
+            if (SSL_write(ssl, req, strlen(req)) <= 0) {
+                printf("[!] GET write failed\n");
+            } else {
+                n = SSL_read(ssl, res, sizeof(res) - 1);
+                if (n > 0) {
+                    res[n] = '\0';
+                    /* Extract message from JSON body */
+                    char *body_start = strstr(res, "\r\n\r\n");
+                    if (body_start) {
+                        body_start += 4;
+                        char *msg = strstr(body_start, "\"message\":\"");
+                        if (msg) {
+                            msg += 11;
+                            char *msg_end = strchr(msg, '"');
+                            if (msg_end) *msg_end = '\0';
+                            printf("\n========================================\n");
+                            printf("  SERVER MESSAGE: %s\n", msg);
+                            printf("========================================\n");
+                        } else {
+                            printf("[!] No message field in: %s\n", body_start);
+                        }
+                    } else {
+                        printf("[!] No body in GET response\n");
+                    }
+                } else {
+                    printf("[!] GET read failed (n=%d)\n", n);
                 }
             }
 

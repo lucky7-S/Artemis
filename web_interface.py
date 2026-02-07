@@ -48,7 +48,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <h2>Peer Table</h2>
     <table>
-        <tr><th>IP Address</th><th>Last Seen</th></tr>
+        <tr><th>IP Address</th><th>Hostname</th><th>OS</th><th>Last Seen</th></tr>
         {peer_rows}
     </table>
 
@@ -109,11 +109,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rows = ""
         for ip, data in peers.items():
             ts = data.get('timestamp', 0)
+            hostname = data.get('hostname', 'unknown')
+            os_info = data.get('os', 'unknown')
             time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else 'Never'
-            rows += f"<tr><td>{ip}</td><td>{time_str}</td></tr>\n"
+            rows += f"<tr><td>{ip}</td><td>{hostname}</td><td>{os_info}</td><td>{time_str}</td></tr>\n"
 
         if not rows:
-            rows = "<tr><td colspan='2'>No peers connected</td></tr>"
+            rows = "<tr><td colspan='4'>No peers connected</td></tr>"
 
         # Parent info
         parent_ip = state.get('parent_ip', 'None')
