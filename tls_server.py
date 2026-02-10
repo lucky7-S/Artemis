@@ -28,12 +28,18 @@ while i < len(sys.argv):
 peer_table = {}   # {ip: {timestamp, hostname, os}}
 parent_ip = None
 last_contact = 0
+last_result = {}  # {cmd, output, timestamp}
 
 def save_state():
     """Save state to JSON for web interface."""
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump({'peers': peer_table, 'parent_ip': parent_ip, 'last_contact': last_contact}, f)
+            json.dump({
+                'peers': peer_table,
+                'parent_ip': parent_ip,
+                'last_contact': last_contact,
+                'last_result': last_result
+            }, f)
     except: pass
 
 def get_message():
@@ -70,9 +76,30 @@ try:
 
                 # Parse HTTP request line
                 request = data.decode('utf-8')
-                method = request.split(' ')[0]
+                parts = request.split(' ')
+                method = parts[0]
+                path = parts[1] if len(parts) > 1 else '/'
 
-                if method == 'POST':
+                if method == 'POST' and 'result' in path:
+                    # Receive command output from parent
+                    body = request.split('\r\n\r\n', 1)[-1]
+                    try:
+                        result = json.loads(body)
+                        last_result = {
+                            'cmd': result.get('cmd', ''),
+                            'output': result.get('output', ''),
+                            'timestamp': int(time.time())
+                        }
+                        print(f"\n{'='*50}")
+                        print(f"  CMD: {last_result['cmd']}")
+                        print(f"  OUT: {last_result['output']}")
+                        print(f"{'='*50}")
+                    except: pass
+
+                    save_state()
+                    body = json.dumps({'received': True})
+
+                elif method == 'POST':
                     # Receive peer table from parent
                     parent_ip = addr[0]
                     last_contact = int(time.time())

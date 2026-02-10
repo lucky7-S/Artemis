@@ -65,6 +65,13 @@ HTML = '''<!DOCTYPE html>
         <input name="message" value="{message}" />
         <button type="submit">Send</button>
     </form>
+
+    <!-- Last Result -->
+    <h3>Last Result</h3>
+    <div class="status">
+        <b>Cmd:</b> {last_cmd}<br>
+        <b>Output:</b> {last_output}
+    </div>
 </body>
 </html>'''
 
@@ -123,9 +130,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 child_diagram += f'<span class="node {os_class}">[{label}] {ip}</span>'
             child_diagram += '</div>'
 
+        # Last command result
+        result = state.get('last_result', {})
+        last_cmd = result.get('cmd', '-')
+        last_output = result.get('output', '-')
+
         return HTML.format(
             parent_ip=parent_ip, parent_time=parent_time, peer_count=len(peers),
-            peer_rows=rows, message=message, child_diagram=child_diagram
+            peer_rows=rows, message=message, child_diagram=child_diagram,
+            last_cmd=last_cmd, last_output=last_output
         )
 
 print(f"[*] Web interface on http://localhost:{PORT}")

