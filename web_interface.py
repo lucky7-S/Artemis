@@ -10,7 +10,34 @@ from urllib.parse import parse_qs
 
 STATE_FILE = 'server_state.json'
 MESSAGE_FILE = 'server_message.txt'
+HISTORY_DIR = 'history'
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+
+# Command history cache
+command_history = []
+last_seen_timestamp = 0
+history_file_count = 0
+
+import os
+if not os.path.exists(HISTORY_DIR):
+    os.makedirs(HISTORY_DIR)
+
+# Find next file number
+existing = [f for f in os.listdir(HISTORY_DIR) if f.startswith('history_') and f.endswith('.json')]
+if existing:
+    history_file_count = max(int(f.split('_')[1].split('.')[0]) for f in existing)
+
+def save_history():
+    """Save history to file and clear cache."""
+    global command_history, history_file_count
+    if not command_history:
+        return
+    history_file_count += 1
+    filename = os.path.join(HISTORY_DIR, f'history_{history_file_count:03d}.json')
+    with open(filename, 'w') as f:
+        json.dump(command_history, f, indent=2)
+    print(f"[*] Saved history to {filename}")
+    command_history = []
 
 HTML = '''<!DOCTYPE html>
 <html>
@@ -66,12 +93,12 @@ HTML = '''<!DOCTYPE html>
         <button type="submit">Send</button>
     </form>
 
-    <!-- Last Result -->
-    <h3>Last Result</h3>
-    <div class="status">
-        <b>Cmd:</b> {last_cmd}<br>
-        <b>Output:</b> {last_output}
-    </div>
+    <!-- Command History -->
+    <h3>Command History</h3>
+    <table>
+        <tr><th>Time</th><th>Command</th><th>Output</th></tr>
+        {history_rows}
+    </table>
 </body>
 </html>'''
 
@@ -130,15 +157,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 child_diagram += f'<span class="node {os_class}">[{label}] {ip}</span>'
             child_diagram += '</div>'
 
-        # Last command result
+        # Check for new command results and add to history
+        global command_history, last_seen_timestamp
         result = state.get('last_result', {})
-        last_cmd = result.get('cmd', '-')
-        last_output = result.get('output', '-')
+        result_ts = result.get('timestamp', 0)
+
+        if result_ts > last_seen_timestamp and result.get('cmd'):
+            command_history.insert(0, {
+                'time': datetime.fromtimestamp(result_ts).strftime('%Y-%m-%d %H:%M:%S'),
+                'cmd': result.get('cmd', ''),
+                'output': result.get('output', '')
+            })
+            last_seen_timestamp = result_ts
+
+            # Save to file when limit reached
+            if len(command_history) >= 20:
+                save_history()
+
+        # Build history rows
+        history_rows = ""
+        for entry in command_history:
+            history_rows += f"<tr><td>{entry['time']}</td><td>{entry['cmd']}</td><td>{entry['output'][:100]}</td></tr>"
+        if not history_rows:
+            history_rows = "<tr><td colspan='3'>No commands executed</td></tr>"
 
         return HTML.format(
             parent_ip=parent_ip, parent_time=parent_time, peer_count=len(peers),
             peer_rows=rows, message=message, child_diagram=child_diagram,
-            last_cmd=last_cmd, last_output=last_output
+            history_rows=history_rows
         )
 
 print(f"[*] Web interface on http://localhost:{PORT}")
