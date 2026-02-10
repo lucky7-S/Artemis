@@ -326,7 +326,7 @@ int main(int argc, char *argv[]) {
                 "Host: %s\r\n"
                 "User-Agent: %s\r\n"
                 "Accept: application/json\r\n"
-                "Connection: close\r\n\r\n",
+                "Connection: keep-alive\r\n\r\n",
                 sni_host, user_agent);
             SSL_write(ssl, req, strlen(req));
             int n = SSL_read(ssl, res, sizeof(res) - 1);

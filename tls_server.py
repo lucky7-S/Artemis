@@ -128,7 +128,7 @@ try:
                     body = '{}'
 
                 # Send response
-                response = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+                response = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: keep-alive\r\n\r\n{body}"
                 ssl_sock.send(response.encode())
 
             ssl_sock.close()
